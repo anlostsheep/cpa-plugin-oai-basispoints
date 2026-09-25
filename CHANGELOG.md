@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.1.10 — 2026-09-25（UTC）
+
+### 修复
+
+- 兼容 Codex CLI 将工具目录放在开发者 `input.additional_tools` 而非顶层 `tools` 的请求。保留显式顶层目录优先、`tool_choice` 限制和命名空间，拒绝冲突工具，并维持原生工具身份与结果回放。
+- 为 `functions.exec`、`functions.wait` 及拒绝路径增加脱敏回归测试；本地测试通过，真实 Basis Points 工具回合仍需安装后验证。
+- 将本 fork 的插件源、商店安装仓库和插件元数据指向 `anlostsheep/cpa-plugin-oai-basispoints`。
+
 ## v0.1.9 — 2026-09-24（UTC）
 
 ### 新增与改进

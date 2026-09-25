@@ -234,7 +234,7 @@ func registration(cfg Config) map[string]any {
 			"Name":             "OpenAI Basis Points",
 			"Version":          Version,
 			"Author":           "jaxson-wang",
-			"GitHubRepository": "https://github.com/JaxsonWang/cpa-plugin-oai-basispoints",
+			"GitHubRepository": "https://github.com/anlostsheep/cpa-plugin-oai-basispoints",
 			"Description":      "CPA Responses adapter for bps.openai.com with safe client-tool relay",
 			"ConfigFields": []map[string]any{
 				{"Name": "responses_url", "Type": "string", "Description": "Basis Points Responses endpoint."},

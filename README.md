@@ -7,7 +7,7 @@
 在管理界面的「第三方插件源 → 插件源 registry URL (plugins.store-sources)」中添加以下地址并保存，然后刷新插件商店，搜索 **CPA OpenAI Basis Points**：
 
 ```text
-https://raw.githubusercontent.com/JaxsonWang/cpa-plugin-oai-basispoints/main/registry.json
+https://raw.githubusercontent.com/anlostsheep/cpa-plugin-oai-basispoints/main/registry.json
 ```
 
 也可合并到 CPA **宿主配置**（`config.yaml`，与下方插件配置共用同一个 `plugins` 节点）：
@@ -16,7 +16,7 @@ https://raw.githubusercontent.com/JaxsonWang/cpa-plugin-oai-basispoints/main/reg
 plugins:
   enabled: true
   store-sources:
-    - https://raw.githubusercontent.com/JaxsonWang/cpa-plugin-oai-basispoints/main/registry.json
+    - https://raw.githubusercontent.com/anlostsheep/cpa-plugin-oai-basispoints/main/registry.json
 ```
 
 保留已有插件源，不要整体覆盖原有 `plugins` 配置；内置官方源由 CPA 自动保留。本源使用宿主原生的 `github-release` 安装方式，最新版本以本仓库已发布的 GitHub Release 为准，不在 registry 中另行维护版本号。CPA 会按运行平台下载 `oai-basispoints_<version>_<goos>_<goarch>.zip`，并使用同一 Release 的 `checksums.txt` 校验。

@@ -29,7 +29,7 @@ func TestPluginStoreRegistryMatchesPlugin(t *testing.T) {
 	if plugin.ID != PluginID || plugin.Install.Type != "github-release" {
 		t.Fatalf("registry does not match published plugin: %+v", plugin)
 	}
-	if plugin.Repository != "https://github.com/JaxsonWang/cpa-plugin-oai-basispoints" {
+	if plugin.Repository != "https://github.com/anlostsheep/cpa-plugin-oai-basispoints" {
 		t.Fatalf("unexpected release repository: %q", plugin.Repository)
 	}
 	if plugin.Name == "" || plugin.Description == "" || plugin.Author == "" {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -59,9 +60,43 @@ func iterToolValues(tools any, namespace string, callback func(toolSpec)) {
 	}
 }
 
+func clientToolValues(source map[string]any) []any {
+	if tools, present := source["tools"]; present {
+		list, _ := tools.([]any)
+		return list
+	}
+	input, _ := source["input"].([]any)
+	var tools []any
+	for _, value := range input {
+		item := objectValue(value)
+		if stringValue(item["type"]) != "additional_tools" || stringValue(item["role"]) != "developer" {
+			continue
+		}
+		list, _ := item["tools"].([]any)
+		tools = append(tools, list...)
+	}
+	return tools
+}
+
 func clientToolSpecs(source map[string]any) map[string]toolSpec {
 	result := map[string]toolSpec{}
-	iterToolValues(source["tools"], "", func(spec toolSpec) { result[spec.Key] = spec })
+	_, topLevel := source["tools"]
+	conflicts := map[string]bool{}
+	iterToolValues(clientToolValues(source), "", func(spec toolSpec) {
+		if topLevel {
+			result[spec.Key] = spec
+			return
+		}
+		if conflicts[spec.Key] {
+			return
+		}
+		if previous, exists := result[spec.Key]; exists && !reflect.DeepEqual(previous.Spec, spec.Spec) {
+			delete(result, spec.Key)
+			conflicts[spec.Key] = true
+			return
+		}
+		result[spec.Key] = spec
+	})
 	return result
 }
 
@@ -126,10 +161,13 @@ func clientToolProtocolInstructions(source map[string]any) string {
 		return "This request is relayed by an external Responses API client, not by the live Excel workbook. Do not call server-injected Excel, Office, connector, or workbook tools. Return the answer as assistant text."
 	}
 	catalog := make([]string, 0, len(specs))
-	iterToolValues(source["tools"], "", func(spec toolSpec) {
-		if _, allowed := specs[spec.Key]; !allowed {
+	listed := map[string]bool{}
+	iterToolValues(clientToolValues(source), "", func(spec toolSpec) {
+		selected, allowed := specs[spec.Key]
+		if !allowed || listed[spec.Key] || !reflect.DeepEqual(selected.Spec, spec.Spec) {
 			return
 		}
+		listed[spec.Key] = true
 		line := "- " + spec.Key + " (" + spec.Type + ")"
 		if description := stringValue(spec.Spec["description"]); description != "" {
 			line += ": " + description
