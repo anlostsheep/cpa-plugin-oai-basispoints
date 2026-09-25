@@ -69,22 +69,36 @@ func wsProxyURL(cfg Config, c credential) string {
 	return strings.TrimSpace(cfg.ProxyURL)
 }
 
-// proxiedHTTPClient 按出口构造 ws 拨号用的 HTTP 客户端；留空或 direct/none 则直连。
-// 支持 http、https、socks5 代理（xray mixed 入站同一端口同时接受 http 与 socks）。
+// validateProxyValue 按 CPA sdk/proxyutil.Parse 的同一规则校验出口：空（继承）、
+// direct/none（显式直连）、或带主机的 socks5/socks5h/http/https URL。其它一律无效。
+func validateProxyValue(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "direct") || strings.EqualFold(trimmed, "none") {
+		return nil
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return errors.New("proxy URL is malformed or missing scheme/host")
+	}
+	switch parsed.Scheme {
+	case "socks5", "socks5h", "http", "https":
+		return nil
+	default:
+		return errors.New("unsupported proxy scheme")
+	}
+}
+
+// proxiedHTTPClient 按出口构造 ws 拨号用的 HTTP 客户端；留空或 direct/none 则直连
+// （Transport.Proxy=nil，不读环境变量代理）。xray mixed 入站同一端口同时接受 http 与 socks。
 func proxiedHTTPClient(proxy string) (*http.Client, error) {
-	switch strings.ToLower(strings.TrimSpace(proxy)) {
-	case "", "direct", "none":
+	if err := validateProxyValue(proxy); err != nil {
+		return nil, fail(400, "invalid_config", "proxy_url is invalid: "+err.Error())
+	}
+	trimmed := strings.TrimSpace(proxy)
+	if trimmed == "" || strings.EqualFold(trimmed, "direct") || strings.EqualFold(trimmed, "none") {
 		return &http.Client{Transport: &http.Transport{Proxy: nil}}, nil
 	}
-	proxyURL, err := url.Parse(strings.TrimSpace(proxy))
-	if err != nil || proxyURL.Host == "" {
-		return nil, fail(400, "invalid_config", "proxy_url is invalid")
-	}
-	switch strings.ToLower(proxyURL.Scheme) {
-	case "http", "https", "socks5":
-	default:
-		return nil, fail(400, "invalid_config", "proxy_url scheme must be http, https or socks5")
-	}
+	proxyURL, _ := url.Parse(trimmed)
 	return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}, nil
 }
 

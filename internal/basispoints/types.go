@@ -255,11 +255,11 @@ func (c *Config) normalize() error {
 		return fail(400, "invalid_config", "transport must be either \"http\" or \"ws\"")
 	}
 
-	// 出站代理：留空表示直连；非空必须是可解析的 http(s)/socks5 URL。
+	// ws 后备出站代理：与凭据 proxy_url 同一规则（CPA proxyutil.Parse）：留空、direct/none
+	// 表示直连；否则须为带主机的 socks5/socks5h/http/https URL。
 	if c.ProxyURL = strings.TrimSpace(c.ProxyURL); c.ProxyURL != "" {
-		proxy, err := url.Parse(c.ProxyURL)
-		if err != nil || proxy.Host == "" || (proxy.Scheme != "http" && proxy.Scheme != "https" && proxy.Scheme != "socks5") {
-			return fail(400, "invalid_config", "proxy_url must be an absolute http(s) or socks5 URL")
+		if err := validateProxyValue(c.ProxyURL); err != nil {
+			return fail(400, "invalid_config", "proxy_url must be direct/none or an absolute socks5/socks5h/http/https URL")
 		}
 	}
 
