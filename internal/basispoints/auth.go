@@ -3,11 +3,11 @@ package basispoints
 import (
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type authParseRequest struct {
@@ -24,11 +24,12 @@ type authRefreshRequest struct {
 }
 
 type credential struct {
-	AccessToken string
-	AccountID   string
-	AuthMode    string
-	Email       string
-	ExpiresAt   time.Time
+	AccessToken   string
+	AccountID     string
+	AccountUserID string
+	AuthMode      string
+	Email         string
+	ExpiresAt     time.Time
 }
 
 func parseCredential(raw []byte) (credential, error) {
@@ -62,13 +63,29 @@ func parseCredential(raw []byte) (credential, error) {
 	if rawExpiry := firstValue(root, "expires_at", "expired"); expiresAt.IsZero() {
 		expiresAt = timeFromValue(rawExpiry)
 	}
+	accountUserID := accountUserIDFromClaims(claims)
+	if accountUserID == "" {
+		accountUserID = firstString(root, "chatgpt_account_user_id", "account_user_id")
+	}
 	return credential{
-		AccessToken: token,
-		AccountID:   accountID,
-		AuthMode:    authMode,
-		Email:       email,
-		ExpiresAt:   expiresAt,
+		AccessToken:   token,
+		AccountID:     accountID,
+		AccountUserID: accountUserID,
+		AuthMode:      authMode,
+		Email:         email,
+		ExpiresAt:     expiresAt,
 	}, nil
+}
+
+// accountUserIDFromClaims 读取 x-openai-account-user-id 头所需的复合用户标识，
+// 取不到时返回空字符串，调用方据此跳过该头。
+func accountUserIDFromClaims(claims map[string]any) string {
+	if auth, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+		if id := firstString(auth, "chatgpt_account_user_id", "account_user_id"); id != "" {
+			return id
+		}
+	}
+	return firstString(claims, "chatgpt_account_user_id", "account_user_id")
 }
 
 func findToken(root map[string]any) string {
@@ -174,6 +191,33 @@ func timeFromValue(value any) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// authFileIdentity 返回 CPA 传入文件在 auth-dir 内的文件名（basename），作为专用标记的
+// 匹配身份。与外部刷新脚本的标记契约保持一致：区分大小写、不做空白归一，不使用 inode。
+func authFileIdentity(name string) string {
+	base := filepath.Base(name)
+	if base == "." || base == ".." || base == string(filepath.Separator) {
+		return ""
+	}
+	return base
+}
+
+// validDedicatedEntry 校验标记契约条目：非空裸文件名，任何位置都不含空白或控制字符，
+// 不含路径分隔符。规则与外部刷新脚本 _load_marking 完全一致（Go 的 unicode.IsSpace ∪
+// unicode.IsControl 与 Python 的 str.isspace() ∪ 类别 Cc 覆盖同一字符集）；不合法即
+// 配置错误，不静默跳过（静默跳过会让一侧漏标，重新引入 native 刷新竞态）。
+func validDedicatedEntry(entry string) bool {
+	if entry == "" {
+		return false
+	}
+	if strings.IndexFunc(entry, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return false
+	}
+	if strings.ContainsAny(entry, "/\\") {
+		return false
+	}
+	return entry != "." && entry != ".." && filepath.Base(entry) == entry
 }
 
 func credentialID(fileName string) string {
@@ -291,6 +335,13 @@ func codexPlanType(raw []byte, accessToken string) string {
 }
 
 func authParse(raw []byte) (map[string]any, error) {
+	return authParseWithDedicated(raw, nil)
+}
+
+// authParseWithDedicated 在原有 native+virtual 展开逻辑上，额外支持「Excel 专用」
+// 隔离：当文件名匹配 dedicated 集合时，只返回一条 oai-basispoints 虚拟记录，
+// 不返回 native codex 记录，从而让 CPA 完全不调度该文件的原生刷新。
+func authParseWithDedicated(raw []byte, dedicated map[string]bool) (map[string]any, error) {
 	var request authParseRequest
 	if err := json.Unmarshal(raw, &request); err != nil {
 		return nil, err
@@ -313,6 +364,27 @@ func authParse(raw []byte) (map[string]any, error) {
 	virtual := authData(request.RawJSON, fileName, c)
 	if provider == Provider {
 		return map[string]any{"Handled": true, "Auth": virtual}, nil
+	}
+	// 专用文件：仅暴露虚拟 oai-basispoints 记录（Auths 长度=1），隐藏 native codex。
+	// 必须同时标记 runtime_only：单条记录不会被 CPA 标为 plugin_virtual，若不加该属性，
+	// CPA 在状态/冷却更新时会 persist 这条记录，把「解析时的旧 token 快照 + type=oai-basispoints」
+	// 写回凭据文件——既改掉文件 type（插件下次不再接管），又可能用旧 token 覆盖外部刷新脚本
+	// 刚写入的新 token。runtime_only 让 persist 直接跳过，凭据文件只由外部刷新脚本写入。
+	// 专用匹配使用 CPA 传入的原始文件名（不做 TrimSpace）：名为 " excel.json " 的文件
+	// 不得命中标记 "excel.json"。
+	rawName := request.FileName
+	if rawName == "" {
+		rawName = request.Path
+	}
+	if dedicated[authFileIdentity(rawName)] {
+		attributes, _ := virtual["Attributes"].(map[string]string)
+		cloned := make(map[string]string, len(attributes)+1)
+		for key, value := range attributes {
+			cloned[key] = value
+		}
+		cloned["runtime_only"] = "true"
+		virtual["Attributes"] = cloned
+		return map[string]any{"Handled": true, "Auths": []any{virtual}}, nil
 	}
 	native, err := nativeCodexAuthData(request.RawJSON, fileName, c)
 	if err != nil {
@@ -380,15 +452,37 @@ func credentialFromExecutor(request ExecutorRequest) (credential, error) {
 	return credential{}, fail(401, "missing_auth", "CPA did not provide a ChatGPT OAuth credential")
 }
 
+// redactTokenMessage 抹掉错误串中所有 bearer 形态的令牌：HTTP 的 "Bearer <tok>" 与
+// WS 子协议里的 "openai-bearer.<tok>"（依赖库在子协议协商失败时可能把它写进错误）。
+// 每个前缀的所有出现都会被替换，而不仅是第一处。
 func redactTokenMessage(message string) string {
-	for _, prefix := range []string{"Bearer ", "bearer "} {
-		if index := strings.Index(message, prefix); index >= 0 {
+	for _, prefix := range []string{"Bearer ", "bearer ", "openai-bearer."} {
+		var out strings.Builder
+		rest := message
+		for {
+			index := strings.Index(rest, prefix)
+			if index < 0 {
+				out.WriteString(rest)
+				break
+			}
 			end := index + len(prefix)
-			for end < len(message) && message[end] != ' ' && message[end] != '"' && message[end] != '\n' {
+			for end < len(rest) && !strings.ContainsRune(" \t\r\n\"',;", rune(rest[end])) {
 				end++
 			}
-			message = message[:index] + prefix + "[REDACTED]" + message[end:]
+			out.WriteString(rest[:index])
+			out.WriteString(prefix)
+			out.WriteString("[REDACTED]")
+			rest = rest[end:]
 		}
+		message = out.String()
 	}
-	return fmt.Sprintf("%s", message)
+	return message
+}
+
+// redactSecret 先按当前令牌精确脱敏，再做前缀形态脱敏。
+func redactSecret(message, secret string) string {
+	if secret != "" {
+		message = strings.ReplaceAll(message, secret, "[REDACTED]")
+	}
+	return redactTokenMessage(message)
 }

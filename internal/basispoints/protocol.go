@@ -628,12 +628,33 @@ func reasoningEffortFromSource(source map[string]any) string {
 	return normalizeEffort(source["reasoning_effort"])
 }
 
+// decodeTransportCode 容错解析 run_officejs 的 code 字段。首次按原样解析；失败时
+// 只重试一次，且仅做无副作用的纯解析（剥掉一层多余的 JSON 字符串转义后再解析），
+// 绝不重复执行任何已经运行过的工具。嵌套的 run_officejs 包裹由 transportEnvelope 负责剥离。
 func decodeTransportCode(value any) map[string]any {
-	return parseArguments(value)
+	if object := objectValue(value); object != nil {
+		return object
+	}
+	if parsed := parseArguments(value); parsed != nil {
+		return parsed
+	}
+	if text, ok := value.(string); ok {
+		trimmed := strings.TrimSpace(text)
+		var unescaped string
+		if json.Unmarshal([]byte(trimmed), &unescaped) == nil && unescaped != text {
+			return parseArguments(unescaped)
+		}
+	}
+	return nil
 }
 
 func isTransportName(name string) bool {
 	return name == transportName || name == transportAlias
+}
+
+// isTransportCall 判断上游返回的输出项是否是本插件的 run_officejs 中转调用。
+func isTransportCall(item map[string]any) bool {
+	return stringValue(item["type"]) == "function_call" && isTransportName(stringValue(item["name"]))
 }
 
 func parseArguments(value any) map[string]any {
@@ -846,6 +867,11 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 		}
 		call, ok := extractNativeClientToolCall(item, specs)
 		if !ok {
+			// run_officejs 的 code 字段本身无法解析成单个目录工具对象时，这是模型
+			// 输出格式问题而非凭据问题，按 4xx 归类，避免 5xx 让 CPA 冷却凭据。
+			if isTransportCall(item) && transportEnvelope(item) == nil {
+				return nil, nil, false, fail(422, "invalid_tool_code", "Basis Points run_officejs code could not be parsed into one catalog-tool JSON object")
+			}
 			// 不把服务器注入工具或损坏的中转载荷交给客户端执行。
 			return nil, nil, false, fail(502, "invalid_tool_call", "Basis Points returned a tool call that does not match the client tool catalog or relay contract")
 		}
@@ -873,23 +899,29 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 	return jsonBytes(response), response, true, nil
 }
 
-func syntheticStream(response map[string]any) []byte {
+// sseEvent 是一条待写出的 SSE 事件（尚未赋 sequence_number）。
+type sseEvent struct {
+	name  string
+	value map[string]any
+}
+
+// syntheticEvents 把完整 Responses 响应展开成客户端事件序列。withPrologue=false 时省略
+// response.created/in_progress（由流式会话提前发出并用心跳保活）。
+func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
 	if response == nil {
 		return nil
 	}
-	created := cloneObject(response)
-	created["status"] = "in_progress"
-	created["output"] = []any{}
-	var builder strings.Builder
-	sequence := 0
-	emit := func(event string, value map[string]any) {
-		value["type"] = event
-		value["sequence_number"] = sequence
-		sequence++
-		writeSSE(&builder, event, value)
+	events := make([]sseEvent, 0, 8)
+	add := func(name string, value map[string]any) {
+		events = append(events, sseEvent{name: name, value: value})
 	}
-	emit("response.created", map[string]any{"response": created})
-	emit("response.in_progress", map[string]any{"response": created})
+	if withPrologue {
+		created := cloneObject(response)
+		created["status"] = "in_progress"
+		created["output"] = []any{}
+		add("response.created", map[string]any{"response": created})
+		add("response.in_progress", map[string]any{"response": cloneObject(created)})
+	}
 	if output, ok := response["output"].([]any); ok {
 		for index, value := range output {
 			item := objectValue(value)
@@ -910,22 +942,45 @@ func syntheticStream(response map[string]any) []byte {
 					added["status"] = "in_progress"
 				}
 			}
-			emit("response.output_item.added", map[string]any{"output_index": index, "item": added})
+			add("response.output_item.added", map[string]any{"output_index": index, "item": added})
 			if field != "" {
 				text, _ := item[field].(string)
 				if text != "" {
-					emit(event+".delta", map[string]any{"output_index": index, "item_id": item["id"], "delta": text})
+					add(event+".delta", map[string]any{"output_index": index, "item_id": item["id"], "delta": text})
 				}
-				emit(event+".done", map[string]any{"output_index": index, "item_id": item["id"], field: text})
+				add(event+".done", map[string]any{"output_index": index, "item_id": item["id"], field: text})
 			}
-			emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+			add("response.output_item.done", map[string]any{"output_index": index, "item": item})
 		}
 	}
 	completed := cloneObject(response)
 	completed["status"] = "completed"
-	emit("response.completed", map[string]any{"response": completed})
-	builder.WriteString("data: [DONE]\n\n")
-	return []byte(builder.String())
+	add("response.completed", map[string]any{"response": completed})
+	return events
+}
+
+// renderSSE 为事件依次赋 sequence_number（从 start 开始）并序列化；返回下一个序号。
+func renderSSE(events []sseEvent, start int, done bool) ([]byte, int) {
+	var builder strings.Builder
+	sequence := start
+	for _, ev := range events {
+		ev.value["type"] = ev.name
+		ev.value["sequence_number"] = sequence
+		sequence++
+		writeSSE(&builder, ev.name, ev.value)
+	}
+	if done {
+		builder.WriteString("data: [DONE]\n\n")
+	}
+	return []byte(builder.String()), sequence
+}
+
+func syntheticStream(response map[string]any) []byte {
+	if response == nil {
+		return nil
+	}
+	payload, _ := renderSSE(syntheticEvents(response, true), 0, true)
+	return payload
 }
 
 func writeSSE(builder *strings.Builder, event string, value any) {

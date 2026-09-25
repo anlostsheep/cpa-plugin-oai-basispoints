@@ -147,7 +147,7 @@ func TestExecutorNativeToolRoundTrip(t *testing.T) {
 							*out.(*streamChunk) = streamChunk{Payload: upstreamSSE, Done: true}
 						case "host.http.stream_close":
 						case "host.stream.emit":
-							emitted = payload.(map[string]any)["payload"].([]byte)
+							emitted = append(emitted, payload.(map[string]any)["payload"].([]byte)...)
 						case "host.stream.close":
 							closed <- payload.(map[string]any)
 						default:

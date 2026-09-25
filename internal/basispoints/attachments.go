@@ -198,16 +198,19 @@ func (s *Service) uploadImage(request ExecutorRequest, endpoint string, image in
 	if err := writer.Close(); err != nil {
 		return "", fail(500, "attachment_encoding", "cannot finish image attachment")
 	}
-	headers := authHeaders(c, false)
+	headers := authHeaders(c, s.config(), false)
 	headers.Set("Content-Type", writer.FormDataContentType())
 	var response upstreamResponse
-	if err := s.call("host.http.do", map[string]any{
+	if err := s.guardedDo(request, c.AccessToken, map[string]any{
 		"host_callback_id": request.HostCallbackID,
 		"method":           http.MethodPost,
 		"url":              endpoint,
 		"headers":          headers,
 		"body":             body.Bytes(),
 	}, &response); err != nil {
+		if isKind(err, "plugin_stopped") || isKind(err, "upstream_timeout") {
+			return "", err
+		}
 		return "", fail(502, "attachment_transport", "Basis Points attachment upload transport failed: "+attachmentErrorMessage([]byte(err.Error()), c, image))
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {

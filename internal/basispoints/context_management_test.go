@@ -69,7 +69,7 @@ func TestContextManagementWireEncoding(t *testing.T) {
 						t.Fatal(err)
 					}
 					if stream {
-						_, err = service.upstreamStream(request, body, credential)
+						_, err = service.upstreamStream(request, body, credential, testGuard(t, service))
 					} else {
 						_, err = service.upstreamRequest(request, body, credential, false)
 					}

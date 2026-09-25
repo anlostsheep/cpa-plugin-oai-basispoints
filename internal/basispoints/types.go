@@ -1,16 +1,18 @@
 package basispoints
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const (
-	Version        = "0.1.10"
+	Version        = "0.1.11"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -18,6 +20,21 @@ const (
 	DefaultResponsesURL  = "https://bps.openai.com/basispoints/api/responses"
 	DefaultUpstreamModel = "gpt-6-astra"
 	DefaultModelID       = "gpt-6-astra-basispoints"
+
+	// 网页版（OfficeOnline）请求头默认值，取自真实 HAR 抓包。
+	DefaultUserAgent     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+	DefaultUAPlatform    = "macOS"
+	DefaultUABrands      = "Google Chrome,Not_A Brand,Chromium"
+	DefaultChromeVersion = "153.0.0.0"
+
+	// TransportHTTP 保持 v0.1.10 的一次性缓冲 HTTP 行为；TransportWS 走 WebSocket。
+	TransportHTTP = "http"
+	TransportWS   = "ws"
+
+	// DefaultHeartbeatSeconds：流式缓冲期间向客户端发送 response.in_progress 心跳的间隔，
+	// 需小于 sub2api stream_data_interval_timeout(180s) 与 Codex 空闲超时(300s)。0 关闭心跳。
+	DefaultHeartbeatSeconds = 15
+	maxHeartbeatSeconds     = 120
 )
 
 var supportedReasoningEfforts = map[string]struct{}{
@@ -78,6 +95,12 @@ type ExecutorRequest struct {
 	AuthAttributes  map[string]string `json:"AuthAttributes"`
 	StreamID        string            `json:"stream_id,omitempty"`
 	HostCallbackID  string            `json:"host_callback_id,omitempty"`
+
+	// lifeCtx / lifeDone 由 execute 在处理任何宿主 HTTP 调用（含附件上传）之前通过
+	// beginStream 绑定：插件停止时取消（cause=errPluginStopped），往返结束时调用 lifeDone。
+	// 未导出，不参与 JSON。
+	lifeCtx  context.Context
+	lifeDone func()
 }
 
 type ExecutorResponse struct {
@@ -110,15 +133,23 @@ type streamChunk struct {
 }
 
 type Config struct {
-	DataDir          string            `yaml:"data_dir" json:"data_dir"`
-	ResponsesURL     string            `yaml:"responses_url" json:"responses_url"`
-	UpstreamModel    string            `yaml:"upstream_model" json:"upstream_model"`
-	Models           []string          `yaml:"models" json:"models"`
-	ModelMappings    map[string]string `yaml:"model_mappings" json:"model_mappings"`
-	TimeoutSeconds   int               `yaml:"timeout_seconds" json:"timeout_seconds"`
-	MaxResponseBytes int               `yaml:"max_response_bytes" json:"max_response_bytes"`
-	AuthMode         string            `yaml:"auth_mode" json:"auth_mode"`
-	ToolsVersionID   string            `yaml:"tools_version_id" json:"tools_version_id"`
+	DataDir            string            `yaml:"data_dir" json:"data_dir"`
+	ResponsesURL       string            `yaml:"responses_url" json:"responses_url"`
+	UpstreamModel      string            `yaml:"upstream_model" json:"upstream_model"`
+	Models             []string          `yaml:"models" json:"models"`
+	ModelMappings      map[string]string `yaml:"model_mappings" json:"model_mappings"`
+	TimeoutSeconds     int               `yaml:"timeout_seconds" json:"timeout_seconds"`
+	MaxResponseBytes   int               `yaml:"max_response_bytes" json:"max_response_bytes"`
+	AuthMode           string            `yaml:"auth_mode" json:"auth_mode"`
+	ToolsVersionID     string            `yaml:"tools_version_id" json:"tools_version_id"`
+	DedicatedAuthFiles []string          `yaml:"dedicated_auth_files" json:"dedicated_auth_files"`
+	UserAgent          string            `yaml:"user_agent" json:"user_agent"`
+	UAPlatform         string            `yaml:"ua_platform" json:"ua_platform"`
+	UABrands           string            `yaml:"ua_brands" json:"ua_brands"`
+	ChromeVersion      string            `yaml:"chrome_version" json:"chrome_version"`
+	Transport          string            `yaml:"transport" json:"transport"`
+	ProxyURL           string            `yaml:"proxy_url" json:"proxy_url"`
+	HeartbeatSeconds   *int              `yaml:"heartbeat_seconds" json:"heartbeat_seconds"`
 }
 
 func defaultConfig() Config {
@@ -130,8 +161,16 @@ func defaultConfig() Config {
 		TimeoutSeconds:   300,
 		MaxResponseBytes: 64 << 20,
 		AuthMode:         "chatgpt",
+		UserAgent:        DefaultUserAgent,
+		UAPlatform:       DefaultUAPlatform,
+		UABrands:         DefaultUABrands,
+		ChromeVersion:    DefaultChromeVersion,
+		Transport:        TransportHTTP,
+		HeartbeatSeconds: intPtr(DefaultHeartbeatSeconds),
 	}
 }
+
+func intPtr(value int) *int { return &value }
 
 func (c *Config) normalize() error {
 	if c == nil {
@@ -191,12 +230,92 @@ func (c *Config) normalize() error {
 		c.ModelMappings = mappings
 	}
 	c.Models = models
+
+	// 网页版请求头默认值：留空时回退到 HAR 抓包默认，避免发送空头。
+	if c.UserAgent = strings.TrimSpace(c.UserAgent); c.UserAgent == "" {
+		c.UserAgent = DefaultUserAgent
+	}
+	if c.UAPlatform = strings.TrimSpace(c.UAPlatform); c.UAPlatform == "" {
+		c.UAPlatform = DefaultUAPlatform
+	}
+	if c.UABrands = strings.TrimSpace(c.UABrands); c.UABrands == "" {
+		c.UABrands = DefaultUABrands
+	}
+	if c.ChromeVersion = strings.TrimSpace(c.ChromeVersion); c.ChromeVersion == "" {
+		c.ChromeVersion = DefaultChromeVersion
+	}
+
+	// 传输方式：仅支持 http 与 ws，默认 http，保持 v0.1.10 行为不变。
+	c.Transport = strings.ToLower(strings.TrimSpace(c.Transport))
+	switch c.Transport {
+	case "":
+		c.Transport = TransportHTTP
+	case TransportHTTP, TransportWS:
+	default:
+		return fail(400, "invalid_config", "transport must be either \"http\" or \"ws\"")
+	}
+
+	// 出站代理：留空表示直连；非空必须是可解析的 http(s)/socks5 URL。
+	if c.ProxyURL = strings.TrimSpace(c.ProxyURL); c.ProxyURL != "" {
+		proxy, err := url.Parse(c.ProxyURL)
+		if err != nil || proxy.Host == "" || (proxy.Scheme != "http" && proxy.Scheme != "https" && proxy.Scheme != "socks5") {
+			return fail(400, "invalid_config", "proxy_url must be an absolute http(s) or socks5 URL")
+		}
+	}
+
+	// 心跳间隔：nil 取默认；0 关闭；上限 120s，保证远低于下游空闲超时。
+	if c.HeartbeatSeconds == nil {
+		c.HeartbeatSeconds = intPtr(DefaultHeartbeatSeconds)
+	} else if *c.HeartbeatSeconds < 0 || *c.HeartbeatSeconds > maxHeartbeatSeconds {
+		return fail(400, "invalid_config", fmt.Sprintf("heartbeat_seconds must be between 0 and %d", maxHeartbeatSeconds))
+	}
+
+	// 被标记为「Excel 专用」的凭据文件名：与外部刷新脚本的标记契约同一规则——
+	// 裸 auth-dir 文件名、区分大小写、不允许首尾空白/路径/重复。不合法即配置错误。
+	if len(c.DedicatedAuthFiles) == 0 {
+		c.DedicatedAuthFiles = nil
+	} else {
+		seenFiles := make(map[string]bool, len(c.DedicatedAuthFiles))
+		for _, name := range c.DedicatedAuthFiles {
+			if !validDedicatedEntry(name) {
+				return fail(400, "invalid_config", fmt.Sprintf("dedicated_auth_files entry %q must be a bare auth-dir filename", name))
+			}
+			if seenFiles[name] {
+				return fail(400, "invalid_config", fmt.Sprintf("dedicated_auth_files has duplicate entry %q", name))
+			}
+			seenFiles[name] = true
+		}
+	}
 	return nil
+}
+
+// heartbeatInterval 返回心跳间隔；0 表示关闭。
+func (c Config) heartbeatInterval() time.Duration {
+	if c.HeartbeatSeconds == nil {
+		return DefaultHeartbeatSeconds * time.Second
+	}
+	return time.Duration(*c.HeartbeatSeconds) * time.Second
+}
+
+// dedicatedSet 返回专用凭据文件名集合，供 auth.parse 隔离判定使用。
+func (c Config) dedicatedSet() map[string]bool {
+	if len(c.DedicatedAuthFiles) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(c.DedicatedAuthFiles))
+	for _, name := range c.DedicatedAuthFiles {
+		set[name] = true
+	}
+	return set
 }
 
 func (c Config) clone() Config {
 	c.Models = append([]string(nil), c.Models...)
 	c.ModelMappings = maps.Clone(c.ModelMappings)
+	c.DedicatedAuthFiles = append([]string(nil), c.DedicatedAuthFiles...)
+	if c.HeartbeatSeconds != nil {
+		c.HeartbeatSeconds = intPtr(*c.HeartbeatSeconds)
+	}
 	return c
 }
 
