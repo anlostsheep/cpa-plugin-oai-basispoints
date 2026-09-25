@@ -40,7 +40,7 @@ func TestRejectedStreamPreservesBodyStatusAndCloses(t *testing.T) {
 				}
 				return nil
 			})
-			_, err := service.upstreamStream(ExecutorRequest{}, map[string]any{"reasoning_effort": "ultra"}, credential{})
+			_, err := service.upstreamStream(ExecutorRequest{}, map[string]any{"reasoning_effort": "ultra"}, credential{}, testGuard(t, service))
 			var apiErr *APIError
 			if !errors.As(err, &apiErr) || apiErr.Status != tc.status || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error=%v", err)
@@ -89,7 +89,7 @@ func TestSuccessfulStreamIsNotReadOrClosedEarly(t *testing.T) {
 		*out.(*upstreamStream) = upstreamStream{StatusCode: 200, StreamID: "success"}
 		return nil
 	})
-	stream, err := service.upstreamStream(ExecutorRequest{}, map[string]any{}, credential{})
+	stream, err := service.upstreamStream(ExecutorRequest{}, map[string]any{}, credential{}, testGuard(t, service))
 	if err != nil || stream.StreamID != "success" {
 		t.Fatalf("stream=%+v error=%v", stream, err)
 	}

@@ -89,7 +89,7 @@ func TestInlineImageUploadWireContract(t *testing.T) {
 				service := NewService()
 				uploads, responses := 0, 0
 				var received map[string]any
-				service.SetHost(func(method string, payload any, out any) error {
+				service.SetHost(opTolerant(func(method string, payload any, out any) error {
 					wire := payload.(map[string]any)
 					if strings.HasSuffix(wire["url"].(string), "/attachments") {
 						uploads++
@@ -116,7 +116,7 @@ func TestInlineImageUploadWireContract(t *testing.T) {
 						*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200}
 					}
 					return nil
-				})
+				}))
 				request := imageRequest(map[string]any{"type": "input_image", "image_url": dataURL, "detail": "high"}, map[string]any{"type": "input_image", "image_url": dataURL})
 				request.Stream = stream
 				sourceRaw := request.Payload
@@ -134,7 +134,7 @@ func TestInlineImageUploadWireContract(t *testing.T) {
 					t.Fatal("upload changed task or turn metadata")
 				}
 				if stream {
-					_, err = service.upstreamStream(request, body, credential)
+					_, err = service.upstreamStream(request, body, credential, testGuard(t, service))
 				} else {
 					_, err = service.upstreamRequest(request, body, credential, false)
 				}
@@ -187,14 +187,14 @@ func TestAttachmentFailureStopsResponseSubmission(t *testing.T) {
 			t.Run(tc.name+"/"+method, func(t *testing.T) {
 				service := NewService()
 				calls := 0
-				service.SetHost(func(method string, payload any, out any) error {
+				service.SetHost(opTolerant(func(method string, payload any, out any) error {
 					calls++
 					if method != "host.http.do" || !strings.HasSuffix(payload.(map[string]any)["url"].(string), "/attachments") {
 						t.Fatal("submitted response after upload failure")
 					}
 					*out.(*upstreamResponse) = upstreamResponse{StatusCode: tc.status, Body: jsonBytes(tc.body)}
 					return tc.err
-				})
+				}))
 				request := imageRequest(map[string]any{"type": "input_image", "image_url": dataURL})
 				request.Stream = method == "executor.execute_stream"
 				request.StreamID = "test-downstream"
@@ -211,7 +211,7 @@ func TestAttachmentFailureStopsResponseSubmission(t *testing.T) {
 func TestInvalidInlineImagesStopBeforeNetworking(t *testing.T) {
 	for _, dataURL := range []string{"data:image/png;base64", "data:text/plain;base64,dGVzdA==", "data:image/png;base64,%%%", "data:image/png;base64,not-base64", "data:image/png;base64,", "data:,image"} {
 		service := NewService()
-		service.SetHost(func(string, any, any) error { t.Error("invalid image reached network"); return nil })
+		service.SetHost(opTolerant(func(string, any, any) error { t.Error("invalid image reached network"); return nil }))
 		request := imageRequest(map[string]any{"type": "input_image", "image_url": dataURL})
 		_, err := service.Handle("executor.execute", jsonBytes(request))
 		var apiErr *APIError
@@ -225,11 +225,11 @@ func TestAttachmentCacheCredentialAndEndpointIsolation(t *testing.T) {
 	dataURL, _ := testImageDataURL(t)
 	service := NewService()
 	uploads := 0
-	service.SetHost(func(method string, payload any, out any) error {
+	service.SetHost(opTolerant(func(method string, payload any, out any) error {
 		uploads++
 		*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200, Body: jsonBytes(map[string]any{"openai_file_id": fmt.Sprintf("file-%d", uploads)})}
 		return nil
-	})
+	}))
 	for _, tc := range []struct{ account, token, endpoint, want string }{
 		{"account-a", "token-a", DefaultResponsesURL, "file-1"},
 		{"account-a", "token-a", DefaultResponsesURL, "file-1"},
@@ -255,14 +255,14 @@ func TestAttachmentCacheCoalescesConcurrentUploads(t *testing.T) {
 	service := NewService()
 	var uploads atomic.Int32
 	started, release := make(chan struct{}), make(chan struct{})
-	service.SetHost(func(method string, payload any, out any) error {
+	service.SetHost(opTolerant(func(method string, payload any, out any) error {
 		if uploads.Add(1) == 1 {
 			close(started)
 		}
 		<-release
 		*out.(*upstreamResponse) = upstreamResponse{StatusCode: 200, Body: jsonBytes(map[string]any{"openai_file_id": "file-concurrent"})}
 		return nil
-	})
+	}))
 	request := imageRequest(map[string]any{"type": "input_image", "image_url": dataURL})
 	var group sync.WaitGroup
 	for range 20 {
@@ -315,10 +315,10 @@ func TestImageUploadPreservesOtherInputKinds(t *testing.T) {
 	}}
 	before := string(jsonBytes(source))
 	service := NewService()
-	service.SetHost(func(string, any, any) error {
+	service.SetHost(opTolerant(func(string, any, any) error {
 		t.Error("unexpected upload or URL download")
 		return errors.New("unexpected host call")
-	})
+	}))
 	if err := service.uploadInputImages(ExecutorRequest{}, source, credential{}, defaultConfig()); err != nil {
 		t.Fatal(err)
 	}
@@ -355,5 +355,16 @@ func TestAttachmentURLRemainsOnConfiguredOrigin(t *testing.T) {
 		if _, err := attachmentURL(source); err == nil {
 			t.Fatal("invalid attachment endpoint accepted")
 		}
+	}
+}
+
+// opTolerant 让旧的假宿主忽略守卫的 operation 管理调用（v0.1.11 起，带 host_callback_id 的
+// host.http.do/do_stream 会先 operation_open、结束时 cancel），不影响各用例的线协议断言。
+func opTolerant(h HostCall) HostCall {
+	return func(method string, payload any, out any) error {
+		if method == "host.http.operation_open" || method == "host.http.cancel" {
+			return nil
+		}
+		return h(method, payload, out)
 	}
 }

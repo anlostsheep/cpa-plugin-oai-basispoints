@@ -249,7 +249,7 @@ func TestModelMappingsExecutorRoutesBothModes(t *testing.T) {
 						*out.(*streamChunk) = streamChunk{Payload: []byte(data), Done: true}
 					case "host.http.stream_close":
 					case "host.stream.emit":
-						emitted = payload.(map[string]any)["payload"].([]byte)
+						emitted = append(emitted, payload.(map[string]any)["payload"].([]byte)...)
 					case "host.stream.close":
 						closed <- payload.(map[string]any)
 					default:
@@ -338,10 +338,18 @@ func TestModelMappingsExampleConfig(t *testing.T) {
 		Enabled bool   `yaml:"enabled"`
 		Config  Config `yaml:",inline"`
 	}
-	if err := node.Decode(&plugin); err != nil || !plugin.Enabled || plugin.Config.DataDir != "" {
-		t.Fatalf("example must enable the plugin without persistent overrides: %v", err)
+	// v0.1.11：示例启用持久化目录（使用 dedicated_auth_files 时外部刷新脚本以其中的
+	// settings.json 为标记来源）；YAML 键优先，镜像只补缺，不再覆盖模型列表。
+	if err := node.Decode(&plugin); err != nil || !plugin.Enabled || plugin.Config.DataDir != "plugins/oai-basispoints-data" {
+		t.Fatalf("example must enable the plugin with the documented data_dir: %v (data_dir=%q)", err, plugin.Config.DataDir)
 	}
-	configYAML, err := yaml.Marshal(node)
+	// 注册时把 data_dir 指向临时目录，避免测试在源码树里写 settings.json。
+	var asMap map[string]any
+	if err := node.Decode(&asMap); err != nil {
+		t.Fatal(err)
+	}
+	asMap["data_dir"] = t.TempDir()
+	configYAML, err := yaml.Marshal(asMap)
 	if err != nil {
 		t.Fatal(err)
 	}

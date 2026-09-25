@@ -221,7 +221,13 @@ func TestClientToolRejectsInvalidCallsWithoutLeakingNativeTools(t *testing.T) {
 			output[0] = native
 			body, response, changed, err := transformResponseBody(jsonBytes(map[string]any{"output": output}), source)
 			var apiError *APIError
-			if !errors.As(err, &apiError) || apiError.Status != 502 || apiError.Kind != "invalid_tool_call" || body != nil || response != nil || changed {
+			// extra-json 是 run_officejs code 字段本身无法解析（尾随多余 JSON），属于模型
+			// 输出格式问题，按 4xx invalid_tool_code 归类，避免 5xx 冷却凭据；其余仍为 502。
+			wantStatus, wantKind := 502, "invalid_tool_call"
+			if name == "extra-json" {
+				wantStatus, wantKind = 422, "invalid_tool_code"
+			}
+			if !errors.As(err, &apiError) || apiError.Status != wantStatus || apiError.Kind != wantKind || body != nil || response != nil || changed {
 				t.Fatalf("invalid call leaked: body=%s changed=%t err=%v", body, changed, err)
 			}
 			if strings.Contains(err.Error(), "private-invalid-args") {

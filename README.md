@@ -1,5 +1,7 @@
 # CPA OpenAI Basis Points 插件
 
+> 本项目 fork 自 [JaxsonWang/cpa-plugin-oai-basispoints](https://github.com/JaxsonWang/cpa-plugin-oai-basispoints)，在其基础上继续维护与扩展。
+
 这是一个 CLIProxyAPI（CPA）原生插件，用 CPA 已有的 ChatGPT/Codex OAuth 凭据直接请求。
 
 ## 通过 CPA 插件商店安装（推荐）

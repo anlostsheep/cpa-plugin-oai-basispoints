@@ -47,9 +47,48 @@ plugins:
       # 仅在已取得确切版本 ID 时填写，不要自行编造。
       tools_version_id: ""
 
+      # 上游传输方式：http（默认，读完上游后一次性回放）或 ws（WebSocket，网页版真实链路）。
+      # 保持 http 时行为与 v0.1.10 完全一致；改为 ws 才启用 WebSocket 传输。
+      transport: http
+
+      # WS 传输的出站代理 URL（仅 transport: ws 生效）。http 传输走 CPA 全局 proxy-url。
+      # 两者应指向同一家宽出口，避免同一账号从两个 IP 出站。留空表示直连。
+      # 仅支持 http(s):// 或 socks5:// 形式，例如 http://127.0.0.1:7890。
+      proxy_url: ""
+
+      # 流式心跳间隔（秒）：插件需等上游完整回复后才回放，期间每隔该秒数向客户端发送
+      # response.in_progress，防止 sub2api(180s)/Codex(300s) 空闲超时切断长回合。
+      # 延迟心跳：建连最多同步等待一个间隔，此窗口内的 401/403/429 以带状态码的错误返回
+      # 给 CPA（可正确换号/冷却）；超过该间隔才先开流发心跳，之后的建连错误无状态码。
+      # 心跳发送失败即视为客户端断开并取消上游。0 关闭心跳（回到 v0.1.10 一次性回放）。
+      # 范围 0～120，默认 15。
+      heartbeat_seconds: 15
+
+      # 标记为「Excel 专用」的凭据文件名：auth-dir 内的裸文件名，原样精确匹配（区分大小写，
+      # 不做任何归一化）。条目不得含路径分隔符、空白或控制字符，也不得重复；否则插件拒绝加载。
+      # 命中的文件在 auth.parse 时只暴露 oai-basispoints 虚拟认证（runtime_only），不再暴露
+      # 原生 codex，CPA 因此完全不调度它的原生刷新，改由外部刷新脚本独占刷新。
+      # 外部刷新脚本从 data_dir/settings.json 读取此列表，因此使用隔离时 data_dir 不能留空。
+      # 修改列表后需重启 CPA 才会重新解析凭据；取消标记前务必先停掉外部刷新 timer（见 runbook）。
+      # 留空表示不隔离任何文件。
+      dedicated_auth_files: []
+      #   - excel-only.json
+
+      # 网页版（OfficeOnline）请求头对齐参数，默认值取自真实 HAR 抓包，通常无需修改。
+      # User-Agent：默认网页版 Chrome UA。
+      user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+      # x-openai-internal-basispoints-browser-ua-platform 的值。
+      ua_platform: macOS
+      # x-openai-internal-basispoints-browser-ua-brands 的值（逗号分隔的品牌串）。
+      ua_brands: "Google Chrome,Not_A Brand,Chromium"
+      # 浏览器主版本号，默认 153.0.0.0。
+      chrome_version: "153.0.0.0"
+
       # 非敏感配置的持久化目录，默认值为 plugins/oai-basispoints-data。
-      # 当前实现会先读取 YAML，再用此目录中已有的 settings.json 覆盖对应字段。
-      # 本示例留空：只由 YAML 管理配置，避免旧文件覆盖模型列表和映射。
-      # 留空不会删除已有的 settings.json，也不会禁用 CPA 的 OAuth 凭据读取。
-      # 如需持久化，请填写 CPA 进程可写目录；相对路径以其工作目录为基准。
-      data_dir: ""
+      # 面板/YAML 是唯一配置来源：YAML 中出现的键总是生效，settings.json 只补齐 YAML 未提供
+      # 的键；每次加载后插件把最终生效的配置原子写回 settings.json（永不写入令牌）。
+      # settings.json 损坏或字段类型错误时插件拒绝加载（不会把损坏的列表当成空列表覆盖）。
+      # 使用 dedicated_auth_files 时必须设置此目录：外部刷新脚本以其中的 settings.json 为
+      # 标记来源。目录应在 auth-dir 之外（CPA 会把 auth-dir 下的 *.json 当作凭据解析）。
+      # 留空则不读写 settings.json（仅适合不使用隔离的场景）。相对路径以 CPA 工作目录为基准。
+      data_dir: plugins/oai-basispoints-data
