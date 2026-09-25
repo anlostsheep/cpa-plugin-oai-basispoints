@@ -395,15 +395,17 @@ func authParseWithDedicated(raw []byte, dedicated map[string]bool) (map[string]a
 	//   - 401 后的补救刷新也只在 Metadata 有 refresh_token 时触发；
 	// 于是 CPA 永远不会轮换该凭据，外部刷新脚本是唯一刷新方。脚本原子改写文件后，
 	// watcher 重新解析，两条记录同时拿到新的 access token。
-	// 两条都标记 runtime_only（多条记录本已是 plugin_virtual，这里显式兜底），CPA 永不
-	// 把解析时的快照写回凭据文件。
+	// 不写回：返回多条记录时，CPA（watcher/synthesizer 与 filestore）会把它们都标为
+	// plugin_virtual，Manager.persist 对 plugin_virtual 直接跳过，两条记录都不会写回文件。
+	// 只有虚拟记录额外标记 runtime_only；native 记录不标——CPAMP 等管理面板会把
+	// runtime_only 凭据整体视为只读（隐藏额度刷新、重置额度等），而 native 记录需要这些
+	// 操作。native 记录不带 refresh_token，额度查询只用 access_token，不会触发轮换。
 	stripped := stripRefreshTokens(request.RawJSON)
 	virtual = authData(stripped, fileName, c)
 	native, err := nativeCodexAuthData(stripped, fileName, c)
 	if err != nil {
 		return nil, err
 	}
-	markRuntimeOnly(native)
 	markRuntimeOnly(virtual)
 	return map[string]any{
 		"Handled": true,

@@ -15,7 +15,8 @@ func codexStorage() []byte {
 
 // P2e（共享模式）：标记文件同时返回 native codex 与 oai-basispoints 两条记录，原生模型照常可用；
 // 两条记录都不携带 refresh_token（Metadata 与 StorageJSON），CPA 因此永远不会轮换该凭据，
-// 外部刷新脚本是唯一刷新方；两条都 runtime_only，CPA 永不把快照写回凭据文件。
+// 外部刷新脚本是唯一刷新方。多条记录由 CPA 标为 plugin_virtual、不写回；只有虚拟记录
+// 额外标 runtime_only，native 记录不标（管理面板对 runtime_only 凭据只读，会隐藏额度刷新）。
 // 未标记（含大小写不同）的文件不接管，交还 CPA 原生加载器。
 func TestDedicatedAuthFileSharedMode(t *testing.T) {
 	cfg := defaultConfig()
@@ -37,12 +38,16 @@ func TestDedicatedAuthFileSharedMode(t *testing.T) {
 	if objectValue(auths[0])["Provider"] != AuthProviderID || objectValue(auths[1])["Provider"] != Provider {
 		t.Fatalf("want [native codex, oai-basispoints], got %v / %v", objectValue(auths[0])["Provider"], objectValue(auths[1])["Provider"])
 	}
+	nativeAttrs, _ := objectValue(auths[0])["Attributes"].(map[string]string)
+	if nativeAttrs["runtime_only"] == "true" {
+		t.Fatalf("native record must not be runtime_only (panels hide quota refresh for it): %#v", nativeAttrs)
+	}
+	virtualAttrs, _ := objectValue(auths[1])["Attributes"].(map[string]string)
+	if virtualAttrs["runtime_only"] != "true" {
+		t.Fatalf("virtual record must stay runtime_only: %#v", virtualAttrs)
+	}
 	for _, a := range auths {
 		record := objectValue(a)
-		attrs, _ := record["Attributes"].(map[string]string)
-		if attrs["runtime_only"] != "true" {
-			t.Fatalf("shared-mode record must be runtime_only: %#v", attrs)
-		}
 		metadata := objectValue(record["Metadata"])
 		for _, key := range refreshTokenKeys {
 			if _, present := metadata[key]; present {
