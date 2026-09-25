@@ -443,7 +443,17 @@ func authRefresh(raw []byte) (map[string]any, error) {
 
 func credentialFromExecutor(request ExecutorRequest) (credential, error) {
 	if len(request.StorageJSON) > 0 {
-		return parseCredential(request.StorageJSON)
+		c, err := parseCredential(request.StorageJSON)
+		if err != nil {
+			return c, err
+		}
+		// 按凭据出口必须有效，否则失败关闭：CPA 对无效值构造不出传输（RoundTripperFor 返回
+		// nil），全局 proxy-url 为空时宿主 http 客户端会退回默认传输——直连或读环境代理，
+		// 绕过指定出口。因此在任何上游调用（含附件上传）之前拒绝。
+		if err := validateProxyValue(c.ProxyURL); err != nil {
+			return c, fail(500, "invalid_proxy", "credential proxy_url is invalid; refusing to send upstream traffic that would bypass the configured egress")
+		}
+		return c, nil
 	}
 	metadata := map[string]any{}
 	for key, value := range request.AuthMetadata {

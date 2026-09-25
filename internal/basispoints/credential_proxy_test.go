@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -53,12 +54,12 @@ func TestWSProxyPrecedenceAndSchemes(t *testing.T) {
 	if got := wsProxyURL(cfg, credential{}); got != "http://127.0.0.1:1" {
 		t.Fatalf("plugin proxy is the fallback, got %q", got)
 	}
-	for _, ok := range []string{"", "direct", "none", "http://127.0.0.1:10811", "https://p:1", "socks5://127.0.0.1:10811"} {
+	for _, ok := range []string{"", "direct", "none", "DIRECT", "http://127.0.0.1:10811", "https://p:1", "socks5://127.0.0.1:10811", "socks5h://127.0.0.1:10811"} {
 		if _, err := proxiedHTTPClient(ok); err != nil {
 			t.Fatalf("%q should be accepted: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"ftp://x:1", "://bad", "http://"} {
+	for _, bad := range []string{"ftp://x:1", "://bad", "http://", "127.0.0.1:10811", "http://127.0.0.1:bad"} {
 		if _, err := proxiedHTTPClient(bad); !isKind(err, "invalid_config") {
 			t.Fatalf("%q should be rejected, got %v", bad, err)
 		}
@@ -93,5 +94,51 @@ func TestWSDialUsesCredentialProxy(t *testing.T) {
 	}
 	if upstreamHits.Load() != 0 {
 		t.Fatal("ws dial bypassed the credential proxy and reached upstream directly")
+	}
+}
+
+// 无效的凭据出口必须失败关闭：在任何宿主 HTTP 调用（上游或附件）之前拒绝，
+// 否则 CPA 构造不出传输、全局为空时宿主会退回默认传输而绕过指定出口。
+func TestInvalidCredentialProxyFailsClosed(t *testing.T) {
+	for _, bad := range []string{"ftp://proxy.local:21", "not a url", "http://127.0.0.1:bad"} {
+		svc := NewService()
+		var hostHTTPCalls atomic.Int32
+		svc.SetHost(func(method string, payload any, out any) error {
+			if strings.HasPrefix(method, "host.http.") {
+				hostHTTPCalls.Add(1)
+			}
+			return nil
+		})
+		for _, stream := range []bool{false, true} {
+			request := jsonBytes(ExecutorRequest{
+				Model:       DefaultModelID,
+				Payload:     jsonBytes(map[string]any{"model": DefaultModelID, "input": "hi", "stream": stream}),
+				Stream:      stream,
+				StreamID:    "bad-proxy",
+				StorageJSON: jsonBytes(map[string]any{"access_token": "test-access", "account_id": "acct", "proxy_url": bad}),
+			})
+			_, err := svc.execute(request, stream)
+			if !isKind(err, "invalid_proxy") {
+				t.Fatalf("proxy %q stream=%v: want invalid_proxy, got %v", bad, stream, err)
+			}
+		}
+		if n := hostHTTPCalls.Load(); n != 0 {
+			t.Fatalf("proxy %q: %d host HTTP calls were made despite the invalid egress", bad, n)
+		}
+	}
+}
+
+func TestPluginProxyConfigAcceptsDirect(t *testing.T) {
+	for _, v := range []string{"direct", "none", "socks5h://127.0.0.1:1"} {
+		cfg := defaultConfig()
+		cfg.ProxyURL = v
+		if err := cfg.normalize(); err != nil {
+			t.Fatalf("plugin proxy_url %q should be accepted: %v", v, err)
+		}
+	}
+	cfg := defaultConfig()
+	cfg.ProxyURL = "ftp://x:1"
+	if err := cfg.normalize(); !isKind(err, "invalid_config") {
+		t.Fatalf("ftp proxy should be rejected, got %v", err)
 	}
 }
