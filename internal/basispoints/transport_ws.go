@@ -60,14 +60,30 @@ func basisPointsWSURL(cfg Config, c credential) (string, error) {
 	return u.String(), nil
 }
 
-// proxiedHTTPClient 按 proxy_url 构造出站 HTTP 客户端；留空则直连。
-func proxiedHTTPClient(cfg Config) (*http.Client, error) {
-	if strings.TrimSpace(cfg.ProxyURL) == "" {
-		return &http.Client{}, nil
+// wsProxyURL 决定 ws 传输的出口：凭据文件的 proxy_url 优先（按凭据设置，与 CPA 对 http
+// 传输注入的出口一致），其次插件配置 proxy_url；"direct"/"none" 表示显式直连。
+func wsProxyURL(cfg Config, c credential) string {
+	if proxy := strings.TrimSpace(c.ProxyURL); proxy != "" {
+		return proxy
 	}
-	proxyURL, err := url.Parse(cfg.ProxyURL)
-	if err != nil {
+	return strings.TrimSpace(cfg.ProxyURL)
+}
+
+// proxiedHTTPClient 按出口构造 ws 拨号用的 HTTP 客户端；留空或 direct/none 则直连。
+// 支持 http、https、socks5 代理（xray mixed 入站同一端口同时接受 http 与 socks）。
+func proxiedHTTPClient(proxy string) (*http.Client, error) {
+	switch strings.ToLower(strings.TrimSpace(proxy)) {
+	case "", "direct", "none":
+		return &http.Client{Transport: &http.Transport{Proxy: nil}}, nil
+	}
+	proxyURL, err := url.Parse(strings.TrimSpace(proxy))
+	if err != nil || proxyURL.Host == "" {
 		return nil, fail(400, "invalid_config", "proxy_url is invalid")
+	}
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http", "https", "socks5":
+	default:
+		return nil, fail(400, "invalid_config", "proxy_url scheme must be http, https or socks5")
 	}
 	return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}, nil
 }
@@ -77,7 +93,7 @@ func (s *Service) dialBasisPointsWS(ctx context.Context, cfg Config, c credentia
 	if err != nil {
 		return nil, err
 	}
-	client, err := proxiedHTTPClient(cfg)
+	client, err := proxiedHTTPClient(wsProxyURL(cfg, c))
 	if err != nil {
 		return nil, err
 	}

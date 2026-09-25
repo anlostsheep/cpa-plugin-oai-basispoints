@@ -30,6 +30,10 @@ type credential struct {
 	AuthMode      string
 	Email         string
 	ExpiresAt     time.Time
+	// ProxyURL 是凭据文件顶层的 proxy_url（按凭据设置的出口；CPA 全局 proxy-url 可为空）。
+	// 插件把它原样交给 CPA（记录的 ProxyURL），CPA 据此为执行上下文注入对应传输，
+	// 插件经宿主发出的 http 请求随之走该出口；ws 传输也优先使用它。
+	ProxyURL string
 }
 
 func parseCredential(raw []byte) (credential, error) {
@@ -67,7 +71,9 @@ func parseCredential(raw []byte) (credential, error) {
 	if accountUserID == "" {
 		accountUserID = firstString(root, "chatgpt_account_user_id", "account_user_id")
 	}
+	proxyURL := strings.TrimSpace(stringValue(root["proxy_url"]))
 	return credential{
+		ProxyURL:      proxyURL,
 		AccessToken:   token,
 		AccountID:     accountID,
 		AccountUserID: accountUserID,
@@ -250,6 +256,8 @@ func authData(raw []byte, fileName string, c credential) map[string]any {
 		"FileName":    fileName,
 		"Label":       label,
 		"StorageJSON": raw,
+		// 按凭据出口：CPA 以记录的 ProxyURL 构造 Auth.ProxyURL，并为执行上下文注入该出口的传输。
+		"ProxyURL": c.ProxyURL,
 		"Metadata": map[string]any{
 			"type":       Provider,
 			"auth_kind":  "oauth",
@@ -308,8 +316,10 @@ func nativeCodexAuthData(raw []byte, fileName string, c credential) (map[string]
 		"FileName":    fileName,
 		"Label":       label,
 		"StorageJSON": raw,
-		"Metadata":    metadata,
-		"Attributes":  attributes,
+		// 与 CPA 原生加载 codex 文件一致：保留按凭据设置的出口。
+		"ProxyURL":   c.ProxyURL,
+		"Metadata":   metadata,
+		"Attributes": attributes,
 	}, nil
 }
 
