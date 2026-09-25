@@ -9,7 +9,7 @@
 
 ### 说明
 
-- 会话标识：请求带 `prompt_cache_key`/`session_id`（Codex CLI 总会带 `prompt_cache_key`）时，`task_id` 取自该键，不受本次修改影响。未带时，`task_id` 由转换后第一个 input 条目的哈希推导；旧版本对 0.157 形态的请求取到的是 `additional_tools` 条目本身，现在取第一个真实会话条目，因此这类请求的 `task_id` 会与旧版本不同，上游对此的影响未验证。`turn_id` 仍按原始 input 计算，本次未改变。
+- 会话标识：请求带 `prompt_cache_key`/`session_id`（Codex CLI 总会带 `prompt_cache_key`）时，`task_id` 与 `turn_id` 都以该键为会话部分，不受本次修改影响。未带时，`task_id` 由转换后第一个 input 条目的哈希推导；旧版本对 0.157 形态的请求取到的是 `additional_tools` 条目本身，现在取第一个真实会话条目，因此这类请求的 `task_id` 会与旧版本不同；`turn_id` 由会话键与 `turnState` 拼成，`turnState` 对原始 input 的计算未改变，但会话指纹变了，`turn_id` 也会随之不同。上游对此的影响未验证。
 
 ## v0.1.12 — 2026-09-26（UTC）
 
