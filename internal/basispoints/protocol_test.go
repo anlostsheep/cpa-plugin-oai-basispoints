@@ -185,7 +185,8 @@ func TestAuthParseExpandsCodexFileIntoNativeAndBasisPointsAuths(t *testing.T) {
 		"account_id":   "file-account-id",
 	})
 	request, _ := json.Marshal(authParseRequest{Provider: AuthProviderID, FileName: "codex-account.json", RawJSON: raw})
-	response, err := authParse(request)
+	// 共享模式只作用于标记文件（未标记文件交还 CPA，见 TestAuthParsePreservesNativeCodexCredentials）。
+	response, err := authParseWithDedicated(request, map[string]bool{"codex-account.json": true})
 	if err != nil {
 		t.Fatal(err)
 	}

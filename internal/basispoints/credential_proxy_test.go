@@ -26,17 +26,21 @@ func TestCredentialProxyURLFlowsIntoRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	records := dedicated["Auths"].([]any)
-	if len(records) != 1 || objectValue(records[0])["ProxyURL"] != proxy {
-		t.Fatalf("dedicated virtual record must carry the credential proxy: %#v", records)
+	if len(records) != 2 {
+		t.Fatalf("marked file must expand into native + virtual records: %#v", records)
 	}
+	for _, record := range records {
+		if objectValue(record)["ProxyURL"] != proxy {
+			t.Fatalf("native and virtual records must both carry the credential proxy: %#v", record)
+		}
+	}
+	// 未标记文件交还 CPA 原生加载器，CPA 按文件里的 proxy_url 处理出口。
 	other, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "other.json", RawJSON: proxiedStorage(proxy)}), cfg.dedicatedSet())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, record := range other["Auths"].([]any) {
-		if objectValue(record)["ProxyURL"] != proxy {
-			t.Fatalf("native and virtual records must both carry the credential proxy: %#v", record)
-		}
+	if other["Handled"] != false {
+		t.Fatalf("unmarked file must not be taken over: %#v", other)
 	}
 	// 未设置时为空串，由 CPA 退回全局设置。
 	plain, _ := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "excel.json", RawJSON: codexStorage()}), cfg.dedicatedSet())

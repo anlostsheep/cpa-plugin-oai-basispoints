@@ -250,15 +250,15 @@ func TestDedicatedMatchUsesRawFileName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := padded["Auths"].([]any); len(got) != 2 {
-		t.Fatalf("padded file name must not match dedicated entry; Auths=%d", len(got))
+	if padded["Handled"] != false {
+		t.Fatalf("padded file name must not match the dedicated entry: %#v", padded)
 	}
 	byPath, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, Path: "/root/.cli-proxy-api/excel-only.json", RawJSON: codexStorage()}), cfg.dedicatedSet())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := byPath["Auths"].([]any); len(got) != 1 {
-		t.Fatalf("path basename should match dedicated entry; Auths=%d", len(got))
+	if got, _ := byPath["Auths"].([]any); len(got) != 2 {
+		t.Fatalf("path basename should match the dedicated entry (shared mode); Auths=%d", len(got))
 	}
 	for _, bad := range []string{"excel only.json", "excel\t.json", "excel .json", "excel .json", "excel\x01.json"} {
 		c := defaultConfig()
