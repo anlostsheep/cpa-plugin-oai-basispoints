@@ -348,9 +348,10 @@ func authParse(raw []byte) (map[string]any, error) {
 	return authParseWithDedicated(raw, nil)
 }
 
-// authParseWithDedicated 在原有 native+virtual 展开逻辑上，额外支持「Excel 专用」
-// 隔离：当文件名匹配 dedicated 集合时，只返回一条 oai-basispoints 虚拟记录，
-// 不返回 native codex 记录，从而让 CPA 完全不调度该文件的原生刷新。
+// authParseWithDedicated 只接管 dedicated 集合中的（「标记」）codex 文件，以共享模式
+// 返回 native codex 与 oai-basispoints 两条记录，二者都不携带 refresh_token、都是
+// runtime_only，使 CPA 无法轮换或写回该凭据（前提：CPA 未以 Home 模式运行，见 CHANGELOG）；
+// 未标记的文件返回 Handled:false，交还 CPA 原生加载器。
 func authParseWithDedicated(raw []byte, dedicated map[string]bool) (map[string]any, error) {
 	var request authParseRequest
 	if err := json.Unmarshal(raw, &request); err != nil {
