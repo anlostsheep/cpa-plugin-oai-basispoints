@@ -1,11 +1,16 @@
 package basispoints
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/coder/websocket"
 )
 
 // codex0157Catalog 按 codex-tui 0.157.0 实际请求的形态构造（已脱敏）：工具目录不在顶层
@@ -42,23 +47,21 @@ func codex0157Source(extra ...map[string]any) map[string]any {
 	}
 }
 
-// findAdditionalTools 递归查找线上请求里任何 additional_tools 条目或原生工具定义（tools 键）。
-func findAdditionalTools(value any, path string) []string {
+// findAdditionalTools 按请求结构检查上游请求：顶层不得有原生工具目录（tools），
+// input 中不得有 additional_tools 条目，也不得有携带 tools 的条目。
+func findAdditionalTools(request map[string]any, path string) []string {
 	var hits []string
-	switch typed := value.(type) {
-	case map[string]any:
-		if strings.EqualFold(strings.TrimSpace(stringValue(typed["type"])), "additional_tools") {
-			hits = append(hits, path+": additional_tools item")
+	if _, ok := request["tools"]; ok {
+		hits = append(hits, path+".tools")
+	}
+	input, _ := request["input"].([]any)
+	for index, value := range input {
+		item := objectValue(value)
+		if strings.EqualFold(strings.TrimSpace(stringValue(item["type"])), "additional_tools") {
+			hits = append(hits, fmt.Sprintf("%s.input[%d]: additional_tools item", path, index))
 		}
-		if _, ok := typed["tools"]; ok {
-			hits = append(hits, path+": tools key")
-		}
-		for key, child := range typed {
-			hits = append(hits, findAdditionalTools(child, path+"."+key)...)
-		}
-	case []any:
-		for index, child := range typed {
-			hits = append(hits, findAdditionalTools(child, fmt.Sprintf("%s[%d]", path, index))...)
+		if _, ok := item["tools"]; ok {
+			hits = append(hits, fmt.Sprintf("%s.input[%d].tools", path, index))
 		}
 	}
 	return hits
@@ -177,5 +180,47 @@ func TestCodex0157ExecRelayAndDirectNativeCallRejected(t *testing.T) {
 	var apiError *APIError
 	if !errors.As(err, &apiError) || apiError.Kind != "invalid_tool_call" {
 		t.Fatalf("direct native call must stay rejected, got %v", err)
+	}
+}
+
+// ws 传输的首帧 response.create 同样不得携带 additional_tools：从原始请求经
+// prepareRequest 得到的产物直接交给 streamOverWS，由 mock 服务器截获首帧断言。
+func TestAdditionalToolsNeverReachWSCreateFrame(t *testing.T) {
+	mock := &mockBPS{}
+	mock.respond = func(ctx context.Context, conn *websocket.Conn) {
+		_ = writeWSFrame(ctx, conn, map[string]any{"type": "response.created", "response": map[string]any{"status": "in_progress"}})
+		_ = writeWSFrame(ctx, conn, map[string]any{"type": "response.completed", "response": completedResponseWithUsage()})
+		_, _, _ = conn.Read(ctx)
+	}
+	server := httptest.NewServer(http.HandlerFunc(mock.handler))
+	defer server.Close()
+
+	svc := newWSService(t, server)
+	raw := jsonBytes(codex0157Source())
+	request := ExecutorRequest{Model: DefaultModelID, Stream: true, StreamID: "s1", Payload: raw, OriginalRequest: raw,
+		StorageJSON: jsonBytes(map[string]any{"access_token": "test-access", "account_id": "test-account"})}
+	body, credential, err := svc.prepareRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.streamOverWS(context.Background(), request, body, credential); err != nil {
+		t.Fatalf("streamOverWS error: %v", err)
+	}
+	mock.mu.Lock()
+	first := mock.firstFrame
+	mock.mu.Unlock()
+	if stringValue(first["type"]) != "response.create" {
+		t.Fatalf("first frame type = %v", first["type"])
+	}
+	if hits := findAdditionalTools(first, "ws"); len(hits) != 0 {
+		t.Fatalf("native tool catalog leaked into ws create frame: %v", hits)
+	}
+	input, _ := first["input"].([]any)
+	var texts []string
+	for _, value := range input {
+		texts = append(texts, itemText(objectValue(value)["content"]))
+	}
+	if joined := strings.Join(texts, "\n"); !strings.Contains(joined, "functions.exec (custom)") || !strings.Contains(joined, "run pwd") {
+		t.Fatal("ws create frame lost the relay catalog or conversation")
 	}
 }

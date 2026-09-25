@@ -5,11 +5,11 @@
 ### 修复
 
 - **Codex CLI 工具调用报 `invalid_tool_call`**：codex-tui 0.157 把工具目录放在 `input` 里的 `additional_tools` 条目（代码模式下为 `functions` 命名空间里的 custom `exec` 等），而不是顶层 `tools`。插件能从该条目解析目录，但转换请求时把原始条目原样转发给了 Basis Points。上游把它当作真实的原生工具定义，模型于是绕过 `run_officejs` 中继，直接返回原生 `custom_tool_call exec`，插件只能按契约以 `invalid_tool_call`（流内 `response.failed`，sub2api 记为上游 502）拒绝，同一轮重试会反复失败。现在 `additional_tools` 条目一律不转发（不论大小写、空白或 role），客户端工具只经中继协议说明传给模型；目录解析规则不变（只采信 developer 条目、顶层 `tools` 优先、冲突同名工具剔除）。修复方式参考原仓库 v0.1.11 的同类修复。
-- 新增回归测试：按 0.157 的请求形态，端到端截获发往上游的请求体（http 非流式与流式），断言其中没有任何 `additional_tools` 条目或原生工具定义、中继目录列出全部工具、会话条目完整保留；`functions.exec` 的中继调用仍还原为 custom 调用且输入保持 JS 字符串；绕过中继的原生直调仍被拒绝。ws 传输复用同一转换产物。
+- 新增回归测试：按 0.157 的请求形态，端到端截获发往上游的请求体（http 非流式与流式），断言其中没有任何 `additional_tools` 条目或原生工具定义、中继目录列出全部工具、会话条目完整保留；ws 传输截获首帧 `response.create` 做同样断言；`functions.exec` 的中继调用仍还原为 custom 调用且输入保持 JS 字符串；绕过中继的原生直调仍被拒绝。
 
 ### 说明
 
-- 上游 input 中不再含 `additional_tools`，未显式提供会话键的请求，其由历史推导的 `task_id`/`turn_id` 会与旧版本不同。这只影响升级瞬间进行中的会话能否复用上游缓存，不影响正确性。
+- 会话标识：请求带 `prompt_cache_key`/`session_id`（Codex CLI 总会带 `prompt_cache_key`）时，`task_id` 取自该键，不受本次修改影响。未带时，`task_id` 由转换后第一个 input 条目的哈希推导；旧版本对 0.157 形态的请求取到的是 `additional_tools` 条目本身，现在取第一个真实会话条目，因此这类请求的 `task_id` 会与旧版本不同，上游对此的影响未验证。`turn_id` 仍按原始 input 计算，本次未改变。
 
 ## v0.1.12 — 2026-09-26（UTC）
 
