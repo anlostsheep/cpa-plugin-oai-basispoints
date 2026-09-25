@@ -32,7 +32,7 @@ plugins:
 3. 在插件配置 `dedicated_auth_files` 中列出要使用 Basis Points 的 `type: codex` OAuth 文件名（auth-dir 内的裸文件名）。只有列出的文件会被插件接管；插件只在内存中读取 token，不生成另一份 token 文件。列出的文件需配套外部刷新脚本（见下文）。
 4. 客户端使用 Responses 协议调用 `gpt-6-astra-basispoints`。模型目录声明图像输入，以及 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 思考等级；`max` 映射为 `xhigh`，`ultra` 原样传递，未指定时默认 `medium`。
 
-插件的 `auth.parse` 只接管 `dedicated_auth_files` 中列出的 `type: codex` OAuth 文件，并以「共享模式」展开两条内存认证：一条保留原生 `codex`（现有 Codex 模型继续使用 CPA 原生执行器），另一条是 `oai-basispoints` 虚拟认证。两条记录都**不携带 refresh_token**，因此 CPA 永远不会轮换该凭据；刷新由外部脚本独占完成（fork 仓库配套 `cpa-codex-token-refresh`），脚本原子改写文件后，CPA 重新加载，两条记录同时拿到新的 access token。两条记录都是 `runtime_only`，CPA 不会把它们写回 OAuth 文件。未列出的 codex 文件插件不接管，由 CPA 原生加载、刷新并写回，也不提供 Basis Points 模型。之所以这样设计：CPA 会把插件展开出的多条记录都标记为虚拟认证、不持久化刷新结果，若由 CPA 刷新，新的 refresh_token 只留在内存，文件中的旧值随即作废，重启后凭据失效。流式响应遵循 Responses SSE 格式，但为保证工具调用可在完整 item 上做安全转换，当前会先读完上游 SSE 再回放给客户端，不是 token 级实时转发。
+插件的 `auth.parse` 只接管 `dedicated_auth_files` 中列出的 `type: codex` OAuth 文件，并以「共享模式」展开两条内存认证：一条保留原生 `codex`（现有 Codex 模型继续使用 CPA 原生执行器），另一条是 `oai-basispoints` 虚拟认证。两条记录都**不携带 refresh_token**，因此 CPA 不会轮换该凭据（**前提：CPA 未以 Home 控制面模式运行**，即启动参数没有 `-home-jwt`；Home 刷新不依赖 refresh_token，启用 Home 时不要使用本模式）；刷新由外部脚本独占完成（fork 仓库配套 `cpa-codex-token-refresh`），脚本原子改写文件后，CPA 重新加载，两条记录同时拿到新的 access token。两条记录都是 `runtime_only`，CPA 不会把它们写回 OAuth 文件。未列出的 codex 文件插件不接管，由 CPA 原生加载、刷新并写回，也不提供 Basis Points 模型。之所以这样设计：CPA 会把插件展开出的多条记录都标记为虚拟认证、不持久化刷新结果，若由 CPA 刷新，新的 refresh_token 只留在内存，文件中的旧值随即作废，重启后凭据失效。流式响应遵循 Responses SSE 格式，但为保证工具调用可在完整 item 上做安全转换，当前会先读完上游 SSE 再回放给客户端，不是 token 级实时转发。
 
 ## 构建
 
