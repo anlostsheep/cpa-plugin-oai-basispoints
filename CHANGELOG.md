@@ -1,10 +1,17 @@
 # 更新日志
 
+## v0.1.12 — 2026-09-26（UTC）
+
+### 修复
+
+- **共享模式的 native 记录不再标记 `runtime_only`**。CPA-Manager-Plus 等管理面板把 `runtime_only` 凭据整体视为只读：卡片上的「刷新额度」按钮、工具栏「刷新额度」、「重置额度」等操作都会被隐藏或跳过，导致标记凭据无法手动刷新额度。写回保护不受影响：插件为标记文件返回两条记录，CPA 会把它们都标为 `plugin_virtual`，`Manager.persist` 对此直接跳过写回；native 记录仍不携带 refresh_token，CPA 仍无法轮换它，外部刷新脚本仍是唯一刷新方。虚拟 `oai-basispoints` 记录保留 `runtime_only`。
+- 面板操作提示：native 卡片恢复后，面板上的「刷新凭证」会把文件标为已过期，由外部脚本在下一轮真正刷新；这属于维护流程之外的写入，不建议使用。
+
 ## v0.1.11 — 2026-09-25（UTC）
 
 ### 新增与改进
 
-- **专用凭据（共享模式）**：新增 `dedicated_auth_files`。命中的 codex 凭据在 `auth.parse` 时同时返回 native codex 与 `oai-basispoints` 两条记录，原生模型照常可用；但两条记录都**不携带 refresh_token**（Metadata 与 StorageJSON 均剔除）。CPA 原生 Codex 刷新只从 Metadata 读 refresh_token，读不到就原样返回；401 后的补救刷新也要求 Metadata 里有 refresh_token。因此 CPA 永远不会轮换该凭据，外部刷新脚本是唯一刷新方；脚本原子改写文件后，watcher 重新解析，两条记录同时拿到新的 access token。两条记录都标记 `runtime_only`，CPA 永不把解析时的快照写回凭据文件。文件身份为 auth-dir 内的裸文件名，按 CPA 传入的原始文件名精确匹配（区分大小写、不做 trim）；非法条目（任意位置的空白或控制字符、路径分隔、重复）视为配置错误，不静默跳过。修改列表后需重启 CPA 才会对已加载凭据生效。依赖前提：CPA 未以 Home 控制面模式运行（启动参数没有 `-home-jwt`）。Home 刷新凭 auth_index 与 access token 摘要换取新认证，不依赖 refresh_token，会绕过这一保护，因此启用 Home 时不要使用本模式。CPA 升级后需复核上述刷新行为。
+- **专用凭据（共享模式）**：新增 `dedicated_auth_files`。命中的 codex 凭据在 `auth.parse` 时同时返回 native codex 与 `oai-basispoints` 两条记录，原生模型照常可用；但两条记录都**不携带 refresh_token**（Metadata 与 StorageJSON 均剔除）。CPA 原生 Codex 刷新只从 Metadata 读 refresh_token，读不到就原样返回；401 后的补救刷新也要求 Metadata 里有 refresh_token。因此 CPA 永远不会轮换该凭据，外部刷新脚本是唯一刷新方；脚本原子改写文件后，watcher 重新解析，两条记录同时拿到新的 access token。两条记录都由 CPA 标为 `plugin_virtual`，CPA 永不把解析时的快照写回凭据文件（v0.1.11 另给两条都加了 `runtime_only`，v0.1.12 起只保留在虚拟记录上）。文件身份为 auth-dir 内的裸文件名，按 CPA 传入的原始文件名精确匹配（区分大小写、不做 trim）；非法条目（任意位置的空白或控制字符、路径分隔、重复）视为配置错误，不静默跳过。修改列表后需重启 CPA 才会对已加载凭据生效。依赖前提：CPA 未以 Home 控制面模式运行（启动参数没有 `-home-jwt`）。Home 刷新凭 auth_index 与 access token 摘要换取新认证，不依赖 refresh_token，会绕过这一保护，因此启用 Home 时不要使用本模式。CPA 升级后需复核上述刷新行为。
 - **不兼容变更：未标记的 codex 凭据不再接管**。v0.1.10 会把每个 codex 文件展开成 native + 虚拟两条记录，CPA 会把多条记录都标为 `plugin_virtual` 并跳过写回：原生刷新得到的新 refresh_token 只留在内存里，文件中的旧值随即作废，CPA 重启后该凭据失效。v0.1.11 对未标记文件返回 `Handled:false`，交还 CPA 原生加载器（CPA 自行刷新并写回）；Basis Points 模型只对 `dedicated_auth_files` 中的凭据提供。升级前请先把需要 Basis Points 的凭据加入该列表，并配套部署外部刷新脚本。
 - **面板为唯一配置来源**：插件持久化的 `settings.json` 改为「生效配置镜像」——宿主 YAML（面板）中出现的键一律以 YAML 为准，镜像只补 YAML 未提供的键，并改为原子写入。修复旧实现中 `settings.json` 覆盖面板修改的问题。镜像损坏（不可读、非 JSON 对象、补缺字段类型错误、非可空字段为 `null`）时插件拒绝加载，不会把损坏的列表当作空列表覆盖回去。外部刷新脚本读取该镜像中的 `dedicated_auth_files`。
 - **流式心跳**（`heartbeat_seconds`，默认 15，0 关闭）：两种传输都需等上游完整回复后回放。建连（http 等待响应头 / ws 拨号 + 首帧）采用**延迟心跳**：最多同步等待一个心跳间隔——窗口内失败（http 以响应头到达为准，非 2xx 的错误正文只做有界读取；读取期间若守卫已因插件停止/客户端断开/总超时中止，以中止原因为准，只有正文读取上限造成的截断才保留原状态码；中止原因只有一个判定点（看守协程只负责被唤醒，与同步检查共用同一方法），按 插件停止 > 客户端断开 > 超时 的固定优先级判定，不依赖看守协程的调度时序或 select 的随机选择）时下游零字节，`execute_stream` 同步返回带 HTTP 状态码的错误，CPA 可按 401/403/429 正确换号或冷却；窗口到期仍未建连才先开流发出 `response.created`，之后建连失败只能以无状态码的流错误关闭（有意的折中）。开流后会话立即发出 `response.created`，缓冲期间定时发送 `response.in_progress`，防止 sub2api(180s)/Codex(300s) 空闲超时切断长回合；最终回放与开场事件序号连续、`response.id` 一致。心跳发送失败即判定客户端断开并取消上游（ws 发送 `cancel` 帧；http 由每个往返唯一的守卫统一中止：发请求前经 `host.http.operation_open` 申请 operation 并随 `do_stream` 携带，断开/停止/超时时调用 `host.http.cancel` 解除**等待响应头**的阻塞，拿到流后再 `stream_close` 解除阻塞中的读取；往返结束时守卫等待看守协程退出、恰好一次关闭上游，之后不再有宿主回调）。
