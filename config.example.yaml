@@ -51,9 +51,10 @@ plugins:
       # 保持 http 时行为与 v0.1.10 完全一致；改为 ws 才启用 WebSocket 传输。
       transport: http
 
-      # WS 传输的出站代理 URL（仅 transport: ws 生效）。http 传输走 CPA 全局 proxy-url。
-      # 两者应指向同一家宽出口，避免同一账号从两个 IP 出站。留空表示直连。
-      # 仅支持 http(s):// 或 socks5:// 形式，例如 http://127.0.0.1:7890。
+      # WS 传输的后备出站代理（仅 transport: ws 生效）。推荐改为在**凭据文件**里设置顶层
+      # proxy_url（按凭据出口）：插件会把它交给 CPA，http 传输随之走该出口；ws 传输也优先用它，
+      # 只有凭据未设置时才用这里。留空或 direct/none 表示直连。
+      # 支持 http(s):// 或 socks5://，例如 http://127.0.0.1:10811。
       proxy_url: ""
 
       # 流式心跳间隔（秒）：插件需等上游完整回复后才回放，期间每隔该秒数向客户端发送
