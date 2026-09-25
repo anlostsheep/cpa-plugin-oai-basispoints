@@ -425,6 +425,13 @@ func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
 		if itemType == "item_reference" {
 			continue
 		}
+		// 客户端工具目录（Codex 放在 input 里的 additional_tools）只经中继协议说明传给模型，
+		// 不向上游转发原始条目：Basis Points 会把它当作真实的原生工具定义，模型随即绕过
+		// run_officejs 直接发出原生调用，插件只能以 invalid_tool_call 拒绝。无论 role 为何
+		// 都剔除——不被信任、未进入目录的条目同样不能作为原生工具暴露给上游。
+		if itemType == "additional_tools" {
+			continue
+		}
 		result = append(result, item)
 	}
 	return result
