@@ -375,31 +375,35 @@ func authParseWithDedicated(raw []byte, dedicated map[string]bool) (map[string]a
 	if provider == Provider {
 		return map[string]any{"Handled": true, "Auth": virtual}, nil
 	}
-	// 专用文件：仅暴露虚拟 oai-basispoints 记录（Auths 长度=1），隐藏 native codex。
-	// 必须同时标记 runtime_only：单条记录不会被 CPA 标为 plugin_virtual，若不加该属性，
-	// CPA 在状态/冷却更新时会 persist 这条记录，把「解析时的旧 token 快照 + type=oai-basispoints」
-	// 写回凭据文件——既改掉文件 type（插件下次不再接管），又可能用旧 token 覆盖外部刷新脚本
-	// 刚写入的新 token。runtime_only 让 persist 直接跳过，凭据文件只由外部刷新脚本写入。
+	// 未标记的文件不接管：交还 CPA 原生加载器（单条 native 记录，CPA 自己刷新并写回）。
+	// 插件一旦把文件展开成多条记录，CPA 会把它们都标为 plugin_virtual 并跳过 persist，
+	// 原生刷新结果就只留在内存里、文件中的旧 refresh_token 随即作废（v0.1.10 的隐患）。
+	// 因此 Basis Points 只提供给由外部刷新脚本独占刷新的「标记」凭据。
 	// 专用匹配使用 CPA 传入的原始文件名（不做 TrimSpace）：名为 " excel.json " 的文件
 	// 不得命中标记 "excel.json"。
 	rawName := request.FileName
 	if rawName == "" {
 		rawName = request.Path
 	}
-	if dedicated[authFileIdentity(rawName)] {
-		attributes, _ := virtual["Attributes"].(map[string]string)
-		cloned := make(map[string]string, len(attributes)+1)
-		for key, value := range attributes {
-			cloned[key] = value
-		}
-		cloned["runtime_only"] = "true"
-		virtual["Attributes"] = cloned
-		return map[string]any{"Handled": true, "Auths": []any{virtual}}, nil
+	if !dedicated[authFileIdentity(rawName)] {
+		return map[string]any{"Handled": false}, nil
 	}
-	native, err := nativeCodexAuthData(request.RawJSON, fileName, c)
+	// 标记文件：共享模式——同时返回 native codex 与 oai-basispoints 两条记录，原生模型照常
+	// 可用；但两条记录都**不携带 refresh_token**（Metadata 与 StorageJSON 均剔除）：
+	//   - CPA 原生 Codex 刷新只从 Metadata 读取 refresh_token，读不到即原样返回、不轮换；
+	//   - 401 后的补救刷新也只在 Metadata 有 refresh_token 时触发；
+	// 于是 CPA 永远不会轮换该凭据，外部刷新脚本是唯一刷新方。脚本原子改写文件后，
+	// watcher 重新解析，两条记录同时拿到新的 access token。
+	// 两条都标记 runtime_only（多条记录本已是 plugin_virtual，这里显式兜底），CPA 永不
+	// 把解析时的快照写回凭据文件。
+	stripped := stripRefreshTokens(request.RawJSON)
+	virtual = authData(stripped, fileName, c)
+	native, err := nativeCodexAuthData(stripped, fileName, c)
 	if err != nil {
 		return nil, err
 	}
+	markRuntimeOnly(native)
+	markRuntimeOnly(virtual)
 	return map[string]any{
 		"Handled": true,
 		"Auths": []any{
@@ -407,6 +411,37 @@ func authParseWithDedicated(raw []byte, dedicated map[string]bool) (map[string]a
 			virtual,
 		},
 	}, nil
+}
+
+// refreshTokenKeys 是 CPA 识别的 refresh token 字段（authHasRefreshCredential 与
+// CodexExecutor.Refresh 读取的键）。
+var refreshTokenKeys = []string{"refresh_token", "refreshToken"}
+
+// stripRefreshTokens 返回去掉顶层 refresh token 字段的凭据 JSON 副本；无法解析时原样返回
+// （parseCredential 已在前面校验过 JSON）。
+func stripRefreshTokens(raw []byte) []byte {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil || root == nil {
+		return raw
+	}
+	for _, key := range refreshTokenKeys {
+		delete(root, key)
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func markRuntimeOnly(record map[string]any) {
+	attributes, _ := record["Attributes"].(map[string]string)
+	cloned := make(map[string]string, len(attributes)+1)
+	for key, value := range attributes {
+		cloned[key] = value
+	}
+	cloned["runtime_only"] = "true"
+	record["Attributes"] = cloned
 }
 
 func authRefresh(raw []byte) (map[string]any, error) {

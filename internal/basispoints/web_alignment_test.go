@@ -13,57 +13,58 @@ func codexStorage() []byte {
 	return jsonBytes(map[string]any{"type": "codex", "access_token": "test-access", "account_id": "test-account"})
 }
 
-// P2e：被标记为 Excel 专用的凭据文件只暴露一条 oai-basispoints 虚拟认证，且标记 runtime_only
-// 使 CPA 不会 persist 它（否则会用旧 token 快照 + type=oai-basispoints 覆盖凭据文件）。
-func TestDedicatedAuthFileReturnsOnlyVirtualRecord(t *testing.T) {
+// P2e（共享模式）：标记文件同时返回 native codex 与 oai-basispoints 两条记录，原生模型照常可用；
+// 两条记录都不携带 refresh_token（Metadata 与 StorageJSON），CPA 因此永远不会轮换该凭据，
+// 外部刷新脚本是唯一刷新方；两条都 runtime_only，CPA 永不把快照写回凭据文件。
+// 未标记（含大小写不同）的文件不接管，交还 CPA 原生加载器。
+func TestDedicatedAuthFileSharedMode(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.DedicatedAuthFiles = []string{"excel-only.json"}
 	if err := cfg.normalize(); err != nil {
 		t.Fatal(err)
 	}
 	dedicated := cfg.dedicatedSet()
+	raw := jsonBytes(map[string]any{"type": "codex", "access_token": "test-access", "account_id": "test-account", "refresh_token": "rt-secret", "refreshToken": "rt-secret-2"})
 
-	resp, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "excel-only.json", RawJSON: codexStorage()}), dedicated)
+	resp, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "excel-only.json", RawJSON: raw}), dedicated)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if resp["Handled"] != true {
-		t.Fatalf("dedicated parse not handled: %#v", resp)
 	}
 	auths, ok := resp["Auths"].([]any)
-	if !ok || len(auths) != 1 {
-		t.Fatalf("dedicated Auths = %#v, want exactly one record", resp["Auths"])
+	if resp["Handled"] != true || !ok || len(auths) != 2 {
+		t.Fatalf("marked file must expand into native + virtual: %#v", resp)
 	}
-	record := objectValue(auths[0])
-	if record["Provider"] != Provider {
-		t.Fatalf("dedicated record provider = %#v, want %q", record["Provider"], Provider)
+	if objectValue(auths[0])["Provider"] != AuthProviderID || objectValue(auths[1])["Provider"] != Provider {
+		t.Fatalf("want [native codex, oai-basispoints], got %v / %v", objectValue(auths[0])["Provider"], objectValue(auths[1])["Provider"])
 	}
-	attrs, _ := record["Attributes"].(map[string]string)
-	if attrs["runtime_only"] != "true" {
-		t.Fatalf("dedicated record must be runtime_only so CPA never persists it; attrs=%#v", attrs)
+	for _, a := range auths {
+		record := objectValue(a)
+		attrs, _ := record["Attributes"].(map[string]string)
+		if attrs["runtime_only"] != "true" {
+			t.Fatalf("shared-mode record must be runtime_only: %#v", attrs)
+		}
+		metadata := objectValue(record["Metadata"])
+		for _, key := range refreshTokenKeys {
+			if _, present := metadata[key]; present {
+				t.Fatalf("%s record carries %s in Metadata; CPA would rotate it", record["Provider"], key)
+			}
+		}
+		if strings.Contains(string(record["StorageJSON"].([]byte)), "rt-secret") {
+			t.Fatalf("%s record carries the refresh token in StorageJSON", record["Provider"])
+		}
+	}
+	if metadata := objectValue(objectValue(auths[0])["Metadata"]); metadata["access_token"] != "test-access" {
+		t.Fatal("native record must keep the access token so native Codex keeps working")
 	}
 
-	// 区分大小写：与外部刷新脚本的标记契约一致，大小写不同不命中。
-	caseDiff, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "Excel-Only.json", RawJSON: codexStorage()}), dedicated)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := caseDiff["Auths"].([]any); len(got) != 2 {
-		t.Fatalf("case-different name must not match dedicated; Auths=%d", len(got))
-	}
-
-	// 未标记文件：仍展开 native codex + virtual 两条记录，且都不带 runtime_only。
-	other, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "other.json", RawJSON: codexStorage()}), dedicated)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := other["Auths"].([]any)
-	if len(got) != 2 {
-		t.Fatalf("unmarked Auths = %d, want 2 (native + virtual)", len(got))
-	}
-	for _, a := range got {
-		if at, _ := objectValue(a)["Attributes"].(map[string]string); at["runtime_only"] == "true" {
-			t.Fatalf("unmarked record must not be runtime_only: %#v", at)
+	// 区分大小写：与外部刷新脚本的标记契约一致，大小写不同即未标记 → 交还 CPA。
+	for _, name := range []string{"Excel-Only.json", "other.json"} {
+		other, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: name, RawJSON: raw}), dedicated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if other["Handled"] != false {
+			t.Fatalf("%s is unmarked and must be left to CPA's native loader: %#v", name, other)
 		}
 	}
 }
@@ -102,8 +103,15 @@ func TestServiceAuthParseHonorsDedicatedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if auths := objectValue(resp)["Auths"].([]any); len(auths) != 1 || objectValue(auths[0])["Provider"] != Provider {
-		t.Fatalf("dedicated file not isolated through Handle: %#v", resp)
+	if auths, _ := objectValue(resp)["Auths"].([]any); len(auths) != 2 || objectValue(auths[0])["Provider"] != AuthProviderID || objectValue(auths[1])["Provider"] != Provider {
+		t.Fatalf("marked file not expanded into shared mode through Handle: %#v", resp)
+	}
+	unmarked, err := svc.Handle("auth.parse", jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "other.json", RawJSON: codexStorage()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if objectValue(unmarked)["Handled"] != false {
+		t.Fatalf("unmarked file must be left to CPA through Handle: %#v", unmarked)
 	}
 }
 

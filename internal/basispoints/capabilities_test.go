@@ -1,6 +1,7 @@
 package basispoints
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -15,7 +16,18 @@ func TestAuthParsePreservesNativeCodexCredentials(t *testing.T) {
 	root["id_token"] = "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOiB7ImNoYXRncHRfcGxhbl90eXBlIjogInBybyJ9fQ."
 	root["note"] = "keep note"
 	raw := jsonBytes(root)
-	response, err := authParse(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "native.json", RawJSON: raw}))
+
+	// 未标记：不接管，交还 CPA 原生加载器（CPA 自己刷新并写回）。
+	unmarked, err := authParse(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "native.json", RawJSON: raw}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unmarked["Handled"] != false {
+		t.Fatalf("unmarked codex file must be left to CPA's native loader: %#v", unmarked)
+	}
+
+	// 标记（共享模式）：native 记录保留全部账号设置，只剔除 refresh_token。
+	response, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "native.json", RawJSON: raw}), map[string]bool{"native.json": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,12 +38,22 @@ func TestAuthParsePreservesNativeCodexCredentials(t *testing.T) {
 		t.Fatal("native account settings changed")
 	}
 	for key, want := range root {
+		if key == "refresh_token" {
+			if _, present := metadata[key]; present {
+				t.Fatal("shared-mode native record must not carry refresh_token")
+			}
+			continue
+		}
 		if !reflect.DeepEqual(metadata[key], want) {
 			t.Errorf("native field %q was not preserved", key)
 		}
 	}
-	if !reflect.DeepEqual(native["StorageJSON"], raw) {
-		t.Fatal("source credential storage changed")
+	var storage map[string]any
+	if err := json.Unmarshal(native["StorageJSON"].([]byte), &storage); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := storage["refresh_token"]; present || storage["access_token"] != "test-access" || storage["note"] != "keep note" {
+		t.Fatalf("native storage must equal the source minus refresh_token: %#v", storage)
 	}
 }
 
@@ -90,7 +112,8 @@ func TestPrepareRequestPreservesRemoteImagesAndReasoningEffort(t *testing.T) {
 
 func TestAuthParseRejectsMalformedNativeStorage(t *testing.T) {
 	raw := []byte(`{"type":"codex","access_token":"test","account_id":"test"} trailing`)
-	_, err := authParse(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "invalid.json", RawJSON: raw}))
+	// 仅标记文件由插件展开（未标记文件交还 CPA 原生加载器，由 CPA 自行报错）。
+	_, err := authParseWithDedicated(jsonBytes(authParseRequest{Provider: AuthProviderID, FileName: "invalid.json", RawJSON: raw}), map[string]bool{"invalid.json": true})
 	if err == nil {
 		t.Fatal("malformed native credential was accepted")
 	}

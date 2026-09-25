@@ -65,13 +65,13 @@ plugins:
       # 范围 0～120，默认 15。
       heartbeat_seconds: 15
 
-      # 标记为「Excel 专用」的凭据文件名：auth-dir 内的裸文件名，原样精确匹配（区分大小写，
-      # 不做任何归一化）。条目不得含路径分隔符、空白或控制字符，也不得重复；否则插件拒绝加载。
-      # 命中的文件在 auth.parse 时只暴露 oai-basispoints 虚拟认证（runtime_only），不再暴露
-      # 原生 codex，CPA 因此完全不调度它的原生刷新，改由外部刷新脚本独占刷新。
-      # 外部刷新脚本从 data_dir/settings.json 读取此列表，因此使用隔离时 data_dir 不能留空。
-      # 修改列表后需重启 CPA 才会重新解析凭据；取消标记前务必先停掉外部刷新 timer（见 runbook）。
-      # 留空表示不隔离任何文件。
+      # 使用 Basis Points 的凭据文件名：auth-dir 内的裸文件名，原样精确匹配，区分大小写。
+      # 条目不得含路径分隔符、空白或控制字符，也不得重复；否则插件拒绝加载。
+      # 命中的文件以「共享模式」加载：native codex 与 oai-basispoints 两条记录都保留（原生模型
+      # 照常可用），但都不携带 refresh_token，CPA 永远不会轮换它，刷新由外部脚本独占完成。
+      # **未列出的 codex 文件插件不接管**：由 CPA 原生加载与刷新，也不提供 Basis Points 模型。
+      # 外部刷新脚本从 data_dir/settings.json 读取此列表，因此使用时 data_dir 不能留空。
+      # 修改列表后需重启 CPA 才会生效；变更前务必先停掉外部刷新 timer 并持锁（见 runbook）。
       dedicated_auth_files: []
       #   - excel-only.json
 
