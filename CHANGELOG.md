@@ -1,5 +1,16 @@
 # 更新日志
 
+## v0.1.15 — 2026-09-26（UTC）
+
+### 新增
+
+- **Codex 网页搜索改走原生 codex**（新配置 `alpha_search_model`，默认留空即关闭）：codex-tui 的网页搜索（`exec` 中调用 `tools.web__run`）单独请求 `/v1/alpha/search`，请求中的模型是当前会话模型。CPA 7.3.17 只从原生 codex 凭据中按模型挑选；Basis Points 模型只挂在本插件的虚拟记录上，因此返回 `auth_not_found`（503），sub2api 随即临时冷却「账号 + 该模型」约 10 秒，期间该模型的请求都报「没有可用账号」。
+  - 配置一个原生 codex 能提供的模型名（如 `gpt-6-luna`）后，插件声明 `model_router` 能力，对 `SourceFormat=codex-alpha-search` 且模型属于本插件（去掉 `(xhigh)` 等档位后缀，支持凭据前缀）的请求返回「改道到 provider `codex`、用该模型挑选凭据」。CPA 随即选中同一账号的原生记录，经其 `proxy_url` 转发到 ChatGPT 搜索后端，消耗原生额度。
+  - OAuth 凭据转发时 CPA 不改写请求体里的模型名，该配置只决定挑选哪个凭据；已实测 ChatGPT 搜索后端接受请求体中的 Basis Points 模型名。
+  - 其余请求（普通 `/v1/responses`、原生模型、当前没有 codex 凭据时）一律返回「不处理」；任何畸形输入都返回「不处理」，不返回错误。
+  - **只在配置了该项时才声明 `model_router`**：声明后 CPA 处理每个请求都会先调用插件一次（带完整请求体；1 MiB 请求体的判定约 0.85 ms）。CPA 在 reconfigure 时按新注册结果重建能力，开关可热生效。
+  - 校验：不能是 Basis Points 模型（改道后仍找不到原生凭据），不能含空白或控制字符，否则拒绝加载。关闭时设为 `""`；删除该键会被 `settings.json` 镜像补回旧值。
+
 ## v0.1.14 — 2026-09-26（UTC）
 
 本版移植原仓库 JaxsonWang/cpa-plugin-oai-basispoints v0.1.10（及 v0.1.12 的 `count_tokens`）中本 fork 缺少的请求/响应契约修复。解析与诊断代码尽量原样采用，并移植了原仓库的契约测试；只在与本 fork 流式架构（延迟心跳、流会话、ws 传输）衔接处做了适配。原仓库 v0.1.12 的 Claude Code 兼容本版未移植。

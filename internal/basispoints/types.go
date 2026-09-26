@@ -9,10 +9,11 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
-	Version        = "0.1.14"
+	Version        = "0.1.15"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -170,6 +171,9 @@ type Config struct {
 	Transport          string            `yaml:"transport" json:"transport"`
 	ProxyURL           string            `yaml:"proxy_url" json:"proxy_url"`
 	HeartbeatSeconds   *int              `yaml:"heartbeat_seconds" json:"heartbeat_seconds"`
+	// AlphaSearchModel 非空时，Basis Points 模型的 Codex 网页搜索（/v1/alpha/search）改由
+	// 原生 codex 凭据处理，并用该原生模型名挑选凭据；留空表示关闭（默认）。
+	AlphaSearchModel string `yaml:"alpha_search_model" json:"alpha_search_model"`
 }
 
 func defaultConfig() Config {
@@ -280,6 +284,17 @@ func (c *Config) normalize() error {
 	if c.ProxyURL = strings.TrimSpace(c.ProxyURL); c.ProxyURL != "" {
 		if err := validateProxyValue(c.ProxyURL); err != nil {
 			return fail(400, "invalid_config", "proxy_url must be direct/none or an absolute socks5/socks5h/http/https URL")
+		}
+	}
+
+	// 网页搜索改道的目标必须是原生 codex 能提供的模型：填 Basis Points 自己的模型等于
+	// 改道后仍找不到原生凭据，属于配置错误。
+	if c.AlphaSearchModel = strings.TrimSpace(c.AlphaSearchModel); c.AlphaSearchModel != "" {
+		if strings.IndexFunc(c.AlphaSearchModel, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return fail(400, "invalid_config", "alpha_search_model must not contain whitespace or control characters")
+		}
+		if isBasisPointsModel(c.AlphaSearchModel, *c) {
+			return fail(400, "invalid_config", "alpha_search_model must be a native codex model, not a Basis Points model: "+c.AlphaSearchModel)
 		}
 	}
 
