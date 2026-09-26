@@ -28,8 +28,8 @@ func TestNamespacedToolCallPreservesNamespace(t *testing.T) {
 			})),
 		})),
 	}
-	call, ok := extractNativeClientToolCall(native, clientToolSpecs(source))
-	if !ok {
+	call, callErr := extractNativeClientToolCall(native, clientToolSpecs(source))
+	if callErr != nil {
 		t.Fatal("namespaced tool was not decoded")
 	}
 	if call["name"] != "js" || call["namespace"] != "mcp__node_repl" {
@@ -130,7 +130,7 @@ func TestClientToolIdentityAndReplay(t *testing.T) {
 					if cached && !reflect.DeepEqual(replayedCall, native) {
 						t.Fatalf("native replay changed: %#v", replayedCall)
 					}
-					envelope := transportEnvelope(replayedCall)
+					envelope, _ := transportEnvelope(replayedCall)
 					if envelope["tool"] != key || !reflect.DeepEqual(envelope["args"], args) {
 						t.Fatalf("replay envelope = %#v", envelope)
 					}
@@ -182,7 +182,7 @@ func TestClientToolArgumentsPreserveLargeIntegers(t *testing.T) {
 	}
 	call["call_id"] = "call_uncached_" + t.Name()
 	replay := translateInputItems([]any{call}, clientToolSpecs(source))
-	if envelope := transportEnvelope(objectValue(replay[0])); !reflect.DeepEqual(envelope["args"], args) {
+	if envelope, _ := transportEnvelope(objectValue(replay[0])); !reflect.DeepEqual(envelope["args"], args) {
 		t.Fatalf("replay lost integer precision: %#v", envelope)
 	}
 }
@@ -223,10 +223,8 @@ func TestClientToolRejectsInvalidCallsWithoutLeakingNativeTools(t *testing.T) {
 			var apiError *APIError
 			// extra-json 是 run_officejs code 字段本身无法解析（尾随多余 JSON），属于模型
 			// 输出格式问题，按 4xx invalid_tool_code 归类，避免 5xx 冷却凭据；其余仍为 502。
-			wantStatus, wantKind := 502, "invalid_tool_call"
-			if name == "extra-json" {
-				wantStatus, wantKind = 422, "invalid_tool_code"
-			}
+			// v0.1.14 起所有中转契约错误统一为 422 invalid_tool_call（附诊断原因），不冷却凭据。
+			wantStatus, wantKind := 422, "invalid_tool_call"
 			if !errors.As(err, &apiError) || apiError.Status != wantStatus || apiError.Kind != wantKind || body != nil || response != nil || changed {
 				t.Fatalf("invalid call leaked: body=%s changed=%t err=%v", body, changed, err)
 			}
@@ -321,7 +319,7 @@ func TestClientToolChoiceConstrainsCallsButNotHistory(t *testing.T) {
 				t.Fatal(err)
 			}
 			input := prepared["input"].([]any)
-			if envelope := transportEnvelope(objectValue(input[len(input)-1])); envelope["tool"] != "alpha.js" {
+			if envelope, _ := transportEnvelope(objectValue(input[len(input)-1])); envelope["tool"] != "alpha.js" {
 				t.Fatalf("tool choice altered history: %#v", input[len(input)-1])
 			}
 		})

@@ -230,7 +230,8 @@ func TestWSStreamSendsCancelFrameOnCancel(t *testing.T) {
 	}
 }
 
-// P2c (e)：server_draining / 断线 / failed / incomplete 报错，且不产生已输出内容的重放。
+// P2c (e)：server_draining / 断线 / failed / 缺少响应对象的终态帧报错，且不产生已输出内容的重放。
+// v0.1.14 起带完整响应对象的 response.incomplete 是合法终态（见 TestWSIncompleteIsTerminal）。
 func TestWSStreamErrorsWithoutReplay(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -249,8 +250,12 @@ func TestWSStreamErrorsWithoutReplay(t *testing.T) {
 			_ = writeWSFrame(ctx, conn, map[string]any{"type": "response.failed"})
 			_, _, _ = conn.Read(ctx)
 		}, "upstream_incomplete"},
-		{"incomplete", func(ctx context.Context, conn *websocket.Conn) {
+		{"incomplete_without_response", func(ctx context.Context, conn *websocket.Conn) {
 			_ = writeWSFrame(ctx, conn, map[string]any{"type": "response.incomplete"})
+			_, _, _ = conn.Read(ctx)
+		}, "invalid_upstream_response"},
+		{"cancelled", func(ctx context.Context, conn *websocket.Conn) {
+			_ = writeWSFrame(ctx, conn, map[string]any{"type": "response.cancelled"})
 			_, _, _ = conn.Read(ctx)
 		}, "upstream_incomplete"},
 	}

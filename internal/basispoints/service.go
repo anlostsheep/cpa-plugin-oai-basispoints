@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -266,7 +267,8 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 	case "executor.execute_stream":
 		return s.execute(raw, true)
 	case "executor.count_tokens":
-		return map[string]any{"Payload": jsonBytes(map[string]any{"input_tokens": 0})}, nil
+		// 不伪造计数成功（移植自原仓库 v0.1.12）。
+		return nil, fail(400, "unsupported_token_count", "oai-basispoints does not provide an accurate standalone token count")
 	case "executor.http_request":
 		return nil, fail(400, "unsupported_method", "use the Basis Points model executor")
 	case "plugin.shutdown":
@@ -298,25 +300,69 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 		return s.executeStream(request, body, credential)
 	}
 	defer done()
-	response, err := s.upstreamRequest(request, body, credential, false)
+	source, err := requestSource(request)
 	if err != nil {
 		return nil, err
 	}
+	// 在交付任何客户端数据前完成全量校验；中转格式错误只在插件内重新生成一次。
+	for attempt := 0; ; attempt++ {
+		upstream, err := s.upstreamRequest(request, body, credential, false)
+		if err != nil {
+			return nil, err
+		}
+		if len(upstream.Body) > s.config().MaxResponseBytes {
+			return nil, fail(502, "upstream_response_too_large", "Basis Points response exceeds configured limit")
+		}
+		response, err := parseResponse(upstream.Body, upstream.Headers)
+		if err != nil {
+			return nil, err
+		}
+		payload, _, _, err := transformResponseBody(jsonBytes(response), source)
+		if err == nil {
+			return map[string]any{"Payload": payload, "Headers": reencodedHeaders(upstream.Headers)}, nil
+		}
+		retry, ok := relayRetryBody(body, response, err, attempt)
+		if !ok {
+			return nil, err
+		}
+		body = retry
+	}
+}
+
+// requestSource 取客户端原始请求（优先 OriginalRequest），用于工具目录校验与回放。
+func requestSource(request ExecutorRequest) (map[string]any, error) {
 	source, err := rawObject(request.OriginalRequest)
 	if err != nil {
 		source, err = rawObject(request.Payload)
 	}
-	if err != nil {
-		return nil, err
+	return source, err
+}
+
+// relayRetryBody 判断本次失败能否重新生成：仅首次尝试、错误是中转契约错误（422
+// invalid_tool_call）、且上游没有因截断而不完整时，返回附带纠正提示（含不含参数的
+// 诊断原因）的新请求体。移植自原仓库 v0.1.10（#6）。
+func relayRetryBody(body map[string]any, response map[string]any, err error, attempt int) (map[string]any, bool) {
+	var apiError *APIError
+	if attempt != 0 || !errors.As(err, &apiError) || apiError.Kind != "invalid_tool_call" || stringValue(response["status"]) == "incomplete" {
+		return nil, false
 	}
-	transformed, _, _, err := transformResponseBody(response.Body, source)
-	if err != nil {
-		return nil, err
+	retry := cloneObject(body)
+	items, _ := body["input"].([]any)
+	retry["input"] = appendBeforeCompaction(append([]any{}, items...), []any{messageItem("developer", transportRetryHint+" Diagnostic: "+apiError.Message)})
+	return retry, true
+}
+
+// reencodedHeaders 结果已重新编码为 JSON，不能继续使用上游的 SSE/压缩/长度等实体头。
+func reencodedHeaders(upstream http.Header) http.Header {
+	headers := upstream.Clone()
+	if headers == nil {
+		headers = make(http.Header)
 	}
-	return map[string]any{
-		"Payload": transformed,
-		"Headers": response.Headers,
-	}, nil
+	headers.Set("Content-Type", "application/json")
+	for _, name := range []string{"Content-Length", "Content-Encoding", "Transfer-Encoding", "ETag"} {
+		headers.Del(name)
+	}
+	return headers
 }
 
 // streamHeaders 是流式执行成功时同步返回给宿主的 SSE 头部。
@@ -416,33 +462,48 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 			}
 			upstream = late.upstream
 		}
-		raw, readErr := s.readGuarded(upstream, guard)
-		// release 等待看守协程退出并关闭上游流；此后本往返不再有守卫发起的宿主回调。
-		guard.release()
-		if readErr != nil {
-			session.fail(readErr)
-			return
-		}
-		source, parseErr := rawObject(request.OriginalRequest)
+		source, parseErr := requestSource(request)
 		if parseErr != nil {
-			source, parseErr = rawObject(request.Payload)
-		}
-		if parseErr != nil {
+			guard.release()
 			session.fail(parseErr)
 			return
 		}
-		response, parseErr := parseFinalStreamResponse(raw)
-		if parseErr != nil {
-			session.fail(parseErr)
-			return
+		for attempt := 0; ; attempt++ {
+			raw, readErr := s.readGuarded(upstream, guard)
+			// release 等待看守协程退出并关闭上游流；此后本往返不再有守卫发起的宿主回调。
+			guard.release()
+			if readErr != nil {
+				session.fail(readErr)
+				return
+			}
+			response, parseErr := parseResponse(raw, upstream.Headers)
+			if parseErr != nil {
+				session.fail(parseErr)
+				return
+			}
+			_, transformedResponse, _, transformErr := transformResponseBody(jsonBytes(response), source)
+			if transformErr == nil {
+				// finish 在持锁的最终输出边界再次检查本代是否已停止。
+				session.finish(transformedResponse)
+				return
+			}
+			retry, ok := relayRetryBody(body, response, transformErr, attempt)
+			if !ok {
+				session.fail(transformErr)
+				return
+			}
+			// 重新生成一次：新的往返使用新的守卫，同样受客户端断开、插件停止与超时约束；
+			// 心跳在此期间继续保活。
+			body = retry
+			guard = s.newUpstreamGuard(request.HostCallbackID, credential.AccessToken, stop, runCtx.Done(), time.Duration(cfg.TimeoutSeconds)*time.Second, timeoutError(cfg))
+			next, err := s.upstreamStream(request, body, credential, guard)
+			if err != nil {
+				guard.release()
+				session.fail(err)
+				return
+			}
+			upstream = next
 		}
-		_, transformedResponse, _, transformErr := transformResponseBody(jsonBytes(response), source)
-		if transformErr != nil {
-			session.fail(transformErr)
-			return
-		}
-		// finish 在持锁的最终输出边界再次检查本代是否已停止。
-		session.finish(transformedResponse)
 	}()
 	return streamHeaders(), nil
 }

@@ -1,5 +1,26 @@
 # 更新日志
 
+## v0.1.14 — 2026-09-26（UTC）
+
+本版移植原仓库 JaxsonWang/cpa-plugin-oai-basispoints v0.1.10（及 v0.1.12 的 `count_tokens`）中本 fork 缺少的请求/响应契约修复。解析与诊断代码尽量原样采用，并移植了原仓库的契约测试；只在与本 fork 流式架构（延迟心跳、流会话、ws 传输）衔接处做了适配。原仓库 v0.1.12 的 Claude Code 兼容本版未移植。
+
+### 修复
+
+- **中转格式诊断 + 插件内重新生成一次**（原仓库 #6）：模型输出不符合 `run_officejs` 中转契约时，错误带结构化原因，例如 `code invalid_json byte_offset=N`、`tool_not_in_catalog`、`arguments_schema_mismatch`、`custom_args_not_string`，不含工具参数或正文。首次出现时，插件在请求末尾附加纠正提示和该原因，自动重新请求一次；仍失败才报错。http 非流式、http 流式、ws 三条路径都支持；流式重试期间心跳照常，每次往返各自受客户端断开、插件停止与超时约束，各自的上游流恰好关闭一次。被拒绝的调用不写入回放缓存。上游因截断而 `incomplete` 时不重试。
+- **中转错误统一为 422 `invalid_tool_call`**：原先非流式下多数中转错误是 502，可能让 CPA 冷却凭据；`invalid_tool_code` 并入 `invalid_tool_call`（诊断原因中的 `code …` 即对应原来的情形）。流式下仍以流内 `response.failed` 正常关闭。
+- **终态解析**（原仓库 #8）：按正文实际格式解码 JSON 或 SSE（非流式遇到 SSE 正文不再失败）；拒绝空正文、HTML、非法 JSON/SSE 帧、多个终态、事件与状态不一致、尾随数据；错误只附内容类型类别和字节数，不回显正文。重新编码后的非流式响应改为 `application/json`，并去掉过时的 `Content-Length` 等实体头。上游在帧内报告的失败仍按原有分类保留 401/403/429，交给 CPA 换号或冷却。
+- **`response.incomplete` 是合法终态**：如达到 `max_output_tokens`，原样以 `response.incomplete` 交给客户端（http 与 ws 相同），不再当作失败，也不伪装成 `response.completed`。`response.cancelled` 按失败处理。
+- **不支持的请求明确拒绝**（原仓库 #3、#9、#10）：
+  - `previous_response_id` → 400 `unsupported_continuation`，避免只带增量 input 时静默丢失上下文。CPA 的 WebSocket 会话对未声明 `websockets` 的凭据会先合并历史、删除该字段再交给插件，不受影响。
+  - `/responses/compact` → 400 `unsupported_compaction`，避免普通生成冒充压缩结果。
+  - `service_tier` 只接受空、`auto`、`default`，且不再转发给上游；其余（`priority`、`fast` 等）→ 400 `unsupported_service_tier`。模型目录不再声明 Fast。
+- **`count_tokens`** 改为 400 `unsupported_token_count`，不再返回伪造的 0。
+
+### 说明
+
+- 重新生成最多额外消耗一次上游请求。
+- `run_officejs` 的 `code` 被多套一层 JSON 字符串转义时，仍按本 fork 原有的容错规则剥掉一层再解析（纯解析，无副作用）。
+
 ## v0.1.13 — 2026-09-26（UTC）
 
 ### 修复

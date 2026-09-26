@@ -2,7 +2,6 @@ package basispoints
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,6 +17,10 @@ func (s *Service) config() Config {
 }
 
 func (s *Service) prepareRequest(request ExecutorRequest) (map[string]any, credential, error) {
+	// 独立压缩端点未实现：明确拒绝，避免普通生成冒充压缩结果（移植自原仓库 #9）。
+	if request.Alt == "responses/compact" {
+		return nil, credential{}, fail(400, "unsupported_compaction", "oai-basispoints does not support /responses/compact; send full input history to /responses")
+	}
 	c, err := credentialFromExecutor(request)
 	if err != nil {
 		return nil, credential{}, err
@@ -283,57 +286,6 @@ func (s *Service) readGuardedInto(stream upstreamStream, g *upstreamGuard, onChu
 			return buffer.Bytes(), nil
 		}
 	}
-}
-
-func parseFinalStreamResponse(raw []byte) (map[string]any, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
-		return nil, fail(502, "invalid_upstream_response", "Basis Points returned an empty stream")
-	}
-	if strings.HasPrefix(trimmed, "{") {
-		var object map[string]any
-		if json.Unmarshal([]byte(trimmed), &object) == nil {
-			return object, nil
-		}
-	}
-	decoder := newSSEDecoder()
-	var completed map[string]any
-	var failure error
-	err := decoder.feed([]byte(raw), func(event, data string) error {
-		if strings.TrimSpace(data) == "[DONE]" {
-			return nil
-		}
-		var object map[string]any
-		if json.Unmarshal([]byte(data), &object) != nil {
-			return nil
-		}
-		typeName := stringValue(object["type"])
-		if typeName == "" {
-			typeName = event
-		}
-		if isUpstreamFailureEvent(typeName) && failure == nil {
-			failure = classifyUpstreamFailure(object, typeName)
-		}
-		if typeName == "response.completed" {
-			if response := objectValue(object["response"]); response != nil {
-				completed = response
-			}
-		}
-		if response := objectValue(object["response"]); response != nil && stringValue(response["status"]) == "completed" {
-			completed = response
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if completed == nil {
-		if failure != nil {
-			return nil, failure
-		}
-		return nil, fail(502, "invalid_upstream_response", "Basis Points stream ended without response.completed")
-	}
-	return completed, nil
 }
 
 type sseDecoder struct {

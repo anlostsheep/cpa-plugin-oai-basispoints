@@ -98,7 +98,8 @@ func firstSafeCode(codes []string) string {
 	return ""
 }
 
-// isUpstreamFailureEvent 判断事件类型是否表示上游本轮失败。
+// isUpstreamFailureEvent 判断事件类型是否表示上游本轮失败。response.incomplete 是合法终态
+// （如达到 max_output_tokens），原样交给客户端，不属于失败。
 func isUpstreamFailureEvent(typeName string) bool {
-	return typeName == "response.failed" || typeName == "response.incomplete" || typeName == "error"
+	return typeName == "response.failed" || typeName == "response.cancelled" || typeName == "error"
 }

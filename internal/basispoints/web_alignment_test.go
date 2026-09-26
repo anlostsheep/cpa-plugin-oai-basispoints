@@ -222,7 +222,7 @@ func TestErrorClassificationBySource(t *testing.T) {
 		}
 	})
 
-	// run_officejs 的 code 无法解析 → 422 invalid_tool_code（非 5xx，避免冷却凭据）。
+	// run_officejs 的 code 无法解析 → 422 invalid_tool_call，附带不含参数的诊断原因（非 5xx，避免冷却凭据）。
 	t.Run("invalid_tool_code_is_422", func(t *testing.T) {
 		source := namespaceTestSource("function", "js", "mcp__node_repl")
 		native := map[string]any{
@@ -231,8 +231,8 @@ func TestErrorClassificationBySource(t *testing.T) {
 		}
 		_, _, _, err := transformResponseBody(jsonBytes(map[string]any{"output": []any{native}}), source)
 		var apiErr *APIError
-		if !errors.As(err, &apiErr) || apiErr.Status != 422 || apiErr.Kind != "invalid_tool_code" {
-			t.Fatalf("unparseable tool code must be 422 invalid_tool_code, got %v", err)
+		if !errors.As(err, &apiErr) || apiErr.Status != 422 || apiErr.Kind != "invalid_tool_call" || !strings.Contains(apiErr.Message, "code trailing_content") {
+			t.Fatalf("unparseable tool code must be 422 invalid_tool_call with a diagnostic, got %v", err)
 		}
 	})
 
