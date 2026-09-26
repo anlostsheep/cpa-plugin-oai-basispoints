@@ -314,11 +314,16 @@ func (t *wsTurn) readUntilCompleted(ctx context.Context) (map[string]any, error)
 				serverResume = token
 				resumeMu.Unlock()
 			}
-		case typeName == "response.completed":
-			if response := objectValue(frame["response"]); response != nil {
-				return response, nil
+		case typeName == "response.completed" || typeName == "response.incomplete":
+			// 与 http 路径同一终态校验：completed / incomplete 原样保留，状态须与事件一致。
+			response, err := terminalResponse(objectValue(frame["response"]))
+			if err != nil {
+				return nil, err
 			}
-			return nil, fail(502, "invalid_upstream_response", "Basis Points response.completed carried no response object")
+			if stringValue(response["status"]) != strings.TrimPrefix(typeName, "response.") {
+				return nil, fail(502, "invalid_upstream_response", "Basis Points stream terminal status mismatch")
+			}
+			return response, nil
 		case isUpstreamFailureEvent(typeName):
 			// 半途失败：报错，不重放。先解析帧内状态/错误码：凭据失效与限流保留
 			// 401/403/429 交给 CPA，其余归为本次请求失败。
@@ -330,7 +335,7 @@ func (t *wsTurn) readUntilCompleted(ctx context.Context) (map[string]any, error)
 			// upstream_sent / heartbeat 等：本传输在 completed 帧一次性拿到全量输出，
 			// 无需逐帧累积。心跳与任意帧到达都视为连接存活。
 			if response := objectValue(frame["response"]); response != nil && stringValue(response["status"]) == "completed" {
-				return response, nil
+				return terminalResponse(response)
 			}
 		}
 	}
@@ -351,10 +356,7 @@ func (s *Service) executeStreamWS(request ExecutorRequest, body map[string]any, 
 		return nil, err
 	}
 	runCtx := request.lifeCtx
-	source, parseErr := rawObject(request.OriginalRequest)
-	if parseErr != nil {
-		source, parseErr = rawObject(request.Payload)
-	}
+	source, parseErr := requestSource(request)
 	if parseErr != nil {
 		done()
 		return nil, parseErr
@@ -392,18 +394,30 @@ func (s *Service) executeStreamWS(request ExecutorRequest, body map[string]any, 
 			}
 			turn = late.turn
 		}
-		completed, err := turn.readUntilCompleted(ctx)
-		if err != nil {
-			session.fail(err)
-			return
+		for attempt := 0; ; attempt++ {
+			completed, err := turn.readUntilCompleted(ctx)
+			if err != nil {
+				session.fail(err)
+				return
+			}
+			_, transformed, _, transformErr := transformResponseBody(jsonBytes(completed), source)
+			if transformErr == nil {
+				// finish 在持锁的最终输出边界再次检查本代是否已停止。
+				session.finish(transformed)
+				return
+			}
+			retry, ok := relayRetryBody(body, completed, transformErr, attempt)
+			if !ok {
+				session.fail(transformErr)
+				return
+			}
+			// 重新生成一次：新连接、新 response.create，同一 ctx（断开/停止/总超时）约束。
+			body = retry
+			if turn, err = s.openWSTurn(ctx, body, c); err != nil {
+				session.fail(err)
+				return
+			}
 		}
-		_, transformed, _, transformErr := transformResponseBody(jsonBytes(completed), source)
-		if transformErr != nil {
-			session.fail(transformErr)
-			return
-		}
-		// finish 在持锁的最终输出边界再次检查本代是否已停止。
-		session.finish(transformed)
 	}()
 	return streamHeaders(), nil
 }
