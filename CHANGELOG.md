@@ -6,9 +6,9 @@
 
 ### 修复
 
-- **中转格式诊断 + 插件内重新生成一次**（原仓库 #6）：模型输出不符合 `run_officejs` 中转契约时，错误带结构化原因，例如 `code invalid_json byte_offset=N`、`tool_not_in_catalog`、`arguments_schema_mismatch`、`custom_args_not_string`，不含工具参数或正文。首次出现时，插件在请求末尾附加纠正提示和该原因，自动重新请求一次；仍失败才报错。http 非流式、http 流式、ws 三条路径都支持；流式重试期间心跳照常，每次往返各自受客户端断开、插件停止与超时约束，各自的上游流恰好关闭一次。被拒绝的调用不写入回放缓存。上游因截断而 `incomplete` 时不重试。
+- **中转格式诊断 + 插件内重新生成一次**（原仓库 #6）：模型输出不符合 `run_officejs` 中转契约时，错误带结构化原因，例如 `code invalid_json byte_offset=N`、`tool_not_in_catalog`、`arguments_schema_mismatch`、`custom_args_not_string`，不含工具参数或正文。首次出现时，插件在请求末尾附加纠正提示和该原因，自动重新请求一次；仍失败才报错。http 非流式、http 流式、ws 三条路径都支持；流式重试期间心跳照常，每次往返都受客户端断开、插件停止约束，各自的上游流恰好关闭一次。首次往返与重新生成共享同一个 `timeout_seconds` 截止时间，重新生成不会重置超时，截止时间已过则不再发起请求。被拒绝的调用不写入回放缓存。上游因截断而 `incomplete` 时不重试。
 - **中转错误统一为 422 `invalid_tool_call`**：原先非流式下多数中转错误是 502，可能让 CPA 冷却凭据；`invalid_tool_code` 并入 `invalid_tool_call`（诊断原因中的 `code …` 即对应原来的情形）。流式下仍以流内 `response.failed` 正常关闭。
-- **终态解析**（原仓库 #8）：按正文实际格式解码 JSON 或 SSE（非流式遇到 SSE 正文不再失败）；拒绝空正文、HTML、非法 JSON/SSE 帧、多个终态、事件与状态不一致、尾随数据；错误只附内容类型类别和字节数，不回显正文。重新编码后的非流式响应改为 `application/json`，并去掉过时的 `Content-Length` 等实体头。上游在帧内报告的失败仍按原有分类保留 401/403/429，交给 CPA 换号或冷却。
+- **终态解析**（原仓库 #8）：按正文实际格式解码 JSON 或 SSE（非流式遇到 SSE 正文不再失败）；拒绝空正文、HTML、非法 JSON/SSE 帧、多个终态、事件与状态不一致、尾随数据；错误只附内容类型类别和字节数，不回显正文。重新编码后的非流式响应改为 `application/json`，并去掉过时的 `Content-Length` 等实体头。上游在帧内报告的失败仍按原有分类映射为 401/403/429。能否把这些状态码交给 CPA 取决于下游流是否已开启：同步返回（非流式，或延迟心跳窗口内）时带状态码；开流之后只能以无状态码的流错误关闭，重新生成那一轮的失败必然属于后者，与 v0.1.11 起延迟心跳的既有折中一致。
 - **`response.incomplete` 是合法终态**：如达到 `max_output_tokens`，原样以 `response.incomplete` 交给客户端（http 与 ws 相同），不再当作失败，也不伪装成 `response.completed`。`response.cancelled` 按失败处理。
 - **不支持的请求明确拒绝**（原仓库 #3、#9、#10）：
   - `previous_response_id` → 400 `unsupported_continuation`，避免只带增量 input 时静默丢失上下文。CPA 的 WebSocket 会话对未声明 `websockets` 的凭据会先合并历史、删除该字段再交给插件，不受影响。
@@ -19,6 +19,7 @@
 ### 说明
 
 - 重新生成最多额外消耗一次上游请求。
+- **未验证**：Codex 0.157 的远程压缩 v2 不走 `/responses/compact`，而是在普通 `/responses` 请求中追加 `compaction_trigger`，并要求返回恰好一个 compaction 输出项。插件对这条路径的处理与 v0.1.13 相同（原样转发），但 Basis Points 是否支持尚无实测；截至本版发布，现网尚未出现 Basis Points 模型触发压缩的记录。
 - `run_officejs` 的 `code` 被多套一层 JSON 字符串转义时，仍按本 fork 原有的容错规则剥掉一层再解析（纯解析，无副作用）。
 
 ## v0.1.13 — 2026-09-26（UTC）

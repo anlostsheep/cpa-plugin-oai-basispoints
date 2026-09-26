@@ -218,7 +218,11 @@ func (s *Service) guardedDo(request ExecutorRequest, secret string, payload map[
 	if request.lifeCtx != nil {
 		shutdown = request.lifeCtx.Done()
 	}
-	g := s.newUpstreamGuard(request.HostCallbackID, secret, nil, shutdown, time.Duration(cfg.TimeoutSeconds)*time.Second, timeoutError(cfg))
+	timeout, ok := request.roundTripTimeout(cfg)
+	if !ok {
+		return timeoutError(cfg)
+	}
+	g := s.newUpstreamGuard(request.HostCallbackID, secret, nil, shutdown, timeout, timeoutError(cfg))
 	defer g.release()
 	if g.operationID != "" {
 		payload["operation_id"] = g.operationID
