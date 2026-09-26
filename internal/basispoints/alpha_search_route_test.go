@@ -220,6 +220,12 @@ func TestStripThinkingSuffixMatchesCPA(t *testing.T) {
 	if !isUnprefixedBasisPointsModel("alias(beta)(xhigh)", cfg) {
 		t.Fatal("alias containing parentheses not recognized with a thinking suffix")
 	}
+	if !isUnprefixedBasisPointsModel("alias(beta)", cfg) || !isBasisPointsModel("alias(beta)", cfg) {
+		t.Fatal("bare alias containing parentheses must match before stripping")
+	}
+	if isUnprefixedBasisPointsModel("alias", cfg) {
+		t.Fatal("stripped base name must not match an alias it is not")
+	}
 }
 
 // 声明路由后每个请求都会经过 model.route，且带着完整请求体：判定不能随请求体变慢太多。
