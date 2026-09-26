@@ -80,26 +80,42 @@ func stripThinkingSuffix(model string) string {
 	return model
 }
 
+// modelCandidates 返回用于匹配的模型名：先是完整名称（别名本身可能含括号），
+// 再是去掉思考档位后缀后的名称。
+func modelCandidates(model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	if stripped := stripThinkingSuffix(model); stripped != model && stripped != "" {
+		return []string{model, stripped}
+	}
+	return []string{model}
+}
+
 // isBasisPointsModel 判断模型名是否由本插件提供（别名，含凭据前缀形式）。
 func isBasisPointsModel(model string, cfg Config) bool {
-	model = stripThinkingSuffix(model)
-	if model == "" {
-		return false
+	for _, candidate := range modelCandidates(model) {
+		if _, ok := catalogCanonicalSlug(candidate, cfg); ok {
+			return true
+		}
 	}
-	_, ok := catalogCanonicalSlug(model, cfg)
-	return ok
+	return false
 }
 
 // isUnprefixedBasisPointsModel 只接受不带凭据前缀的本插件模型。带前缀的请求不改道：
 // 固定的 TargetModel 会丢掉前缀而选错或选不到凭据，且 OAuth 转发会原样保留请求体中的
 // 前缀，上游是否接受未经验证；保持 CPA 原有行为。
 func isUnprefixedBasisPointsModel(model string, cfg Config) bool {
-	model = stripThinkingSuffix(model)
-	if model == "" || strings.Contains(model, "/") {
-		return false
+	for _, candidate := range modelCandidates(model) {
+		if strings.Contains(candidate, "/") {
+			return false
+		}
+		if _, ok := catalogCanonicalSlug(candidate, cfg); ok {
+			return true
+		}
 	}
-	_, ok := catalogCanonicalSlug(model, cfg)
-	return ok
+	return false
 }
 
 func containsFold(values []string, want string) bool {

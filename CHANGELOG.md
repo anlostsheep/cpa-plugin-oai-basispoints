@@ -6,7 +6,7 @@
 
 - **Codex 网页搜索改走原生 codex**（新配置 `alpha_search_model`，默认留空即关闭）：codex-tui 的网页搜索（`exec` 中调用 `tools.web__run`）单独请求 `/v1/alpha/search`，请求中的模型是当前会话模型。CPA 7.3.17 只从原生 codex 凭据中按模型挑选；Basis Points 模型只挂在本插件的虚拟记录上，因此返回 `auth_not_found`（503），sub2api 随即临时冷却「账号 + 该模型」约 10 秒，期间该模型的请求都报「没有可用账号」。
   - 配置一个原生 codex 能提供的模型名（如 `gpt-6-luna`）后，插件声明 `model_router` 能力，对 `SourceFormat=codex-alpha-search` 且模型属于本插件（按 CPA 规则从最后一个 `(` 去掉 `(xhigh)` 等档位后缀）的请求返回「改道到 provider `codex`、用该模型挑选凭据」。CPA 随即在原生 codex 凭据中重新挑选，经所选凭据的 `proxy_url` 转发到 ChatGPT 搜索后端，消耗所选凭据的额度。
-  - **账号归属前提**：CPA 的路由契约无法指定凭据。只有当 CPA 中能提供该模型的原生 codex 凭据恰好是 Basis Points 凭据的同一账号时，搜索才一定由同一账号执行；存在其他原生 codex 凭据或获准 alpha search 的 codex API key 时，搜索可能由它们执行并消耗其额度（与原生模型自己的网页搜索相同）。增加 codex 凭据前应先评估，必要时把 `alpha_search_model` 设为 `""`。
+  - **账号归属前提**：CPA 的路由契约无法指定凭据。只有当 CPA 中能提供该模型的原生 codex 凭据恰好是 Basis Points 凭据的同一账号时，搜索才一定由同一账号执行；存在其他原生 codex 凭据或获准 alpha search 的 codex API key 时，搜索可能由它们执行并消耗其额度（与原生模型自己的网页搜索相同）。增加 codex 凭据前应先评估，必要时把 `alpha_search_model` 设为 `""`。CPA 以 Home 模式运行（`-home-jwt`）时会从 Home 凭据池挑选，本地清点不足以证明账号归属，此时不要启用（共享模式本身也要求不以 Home 模式运行）。
   - **带凭据前缀的请求不改道**：固定的目标模型会丢掉前缀而选错或选不到凭据，且 OAuth 转发会原样保留请求体中的前缀，上游是否接受未经验证；这类请求保持 CPA 原有行为。
   - **目标可用性无法预检**：插件只能确认有 codex 提供方，看不到 CPA 的模型注册表与冷却状态；目标模型不可用时 CPA 挑选失败，结果与未改道时相同（503）。上线后需冒烟验证。
   - OAuth 凭据转发时 CPA 不改写请求体里的模型名，该配置只决定挑选哪个凭据；已实测 ChatGPT 搜索后端接受请求体中的 Basis Points 模型名。
