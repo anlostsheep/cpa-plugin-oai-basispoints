@@ -101,6 +101,26 @@ type ExecutorRequest struct {
 	// 未导出，不参与 JSON。
 	lifeCtx  context.Context
 	lifeDone func()
+	// deadline 是模型往返（首次 + 至多一次重新生成）共享的总截止时间，零值表示不限。
+	// timeout_seconds 约束的是整次客户端请求，重新生成不能重置它。
+	deadline time.Time
+}
+
+// roundTripTimeout 返回下一次上游往返可用的超时：设置了 deadline 时取剩余时长与配置的
+// 较小值；已到期返回 ok=false，调用方应直接以超时结束，不再发起新的往返。
+func (r ExecutorRequest) roundTripTimeout(cfg Config) (time.Duration, bool) {
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if r.deadline.IsZero() {
+		return timeout, true
+	}
+	remaining := time.Until(r.deadline)
+	if remaining <= 0 {
+		return 0, false
+	}
+	if remaining < timeout {
+		timeout = remaining
+	}
+	return timeout, true
 }
 
 type ExecutorResponse struct {

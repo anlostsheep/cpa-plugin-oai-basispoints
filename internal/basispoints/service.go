@@ -305,6 +305,8 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 		return nil, err
 	}
 	// 在交付任何客户端数据前完成全量校验；中转格式错误只在插件内重新生成一次。
+	// 两次往返共享同一截止时间（附件上传在此之前，另行计时）。
+	request.deadline = time.Now().Add(time.Duration(s.config().TimeoutSeconds) * time.Second)
 	for attempt := 0; ; attempt++ {
 		upstream, err := s.upstreamRequest(request, body, credential, false)
 		if err != nil {
@@ -431,6 +433,8 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 	// 监听 stop / 本代 shutdown / 超时，并能取消阻塞中的 do_stream 与 stream_read。
 	stop := make(chan struct{})
 	var stopOnce sync.Once
+	// 首次往返与至多一次重新生成共享同一截止时间。
+	request.deadline = time.Now().Add(time.Duration(cfg.TimeoutSeconds) * time.Second)
 	guard := s.newUpstreamGuard(request.HostCallbackID, credential.AccessToken, stop, runCtx.Done(), time.Duration(cfg.TimeoutSeconds)*time.Second, timeoutError(cfg))
 	connected := make(chan httpConnectResult, 1)
 	go func() {
@@ -492,10 +496,16 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				session.fail(transformErr)
 				return
 			}
-			// 重新生成一次：新的往返使用新的守卫，同样受客户端断开、插件停止与超时约束；
-			// 心跳在此期间继续保活。
+			// 重新生成一次：新的往返使用新的守卫，同样受客户端断开、插件停止约束，超时只剩
+			// 首次往返用剩的时长；心跳在此期间继续保活。此时下游流已开启，本次往返的失败
+			// （含 401/403/429）只能以无状态码的流错误关闭，与延迟心跳的既有折中一致。
 			body = retry
-			guard = s.newUpstreamGuard(request.HostCallbackID, credential.AccessToken, stop, runCtx.Done(), time.Duration(cfg.TimeoutSeconds)*time.Second, timeoutError(cfg))
+			remaining, ok := request.roundTripTimeout(cfg)
+			if !ok {
+				session.fail(timeoutError(cfg))
+				return
+			}
+			guard = s.newUpstreamGuard(request.HostCallbackID, credential.AccessToken, stop, runCtx.Done(), remaining, timeoutError(cfg))
 			next, err := s.upstreamStream(request, body, credential, guard)
 			if err != nil {
 				guard.release()
