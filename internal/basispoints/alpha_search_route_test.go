@@ -52,7 +52,10 @@ func TestAlphaSearchRouteDecisionMatrix(t *testing.T) {
 		{"bp_model", alphaSearchSourceFormat, "gpt-5.6-sol", providers, true},
 		{"bp_model_other_alias", alphaSearchSourceFormat, "gpt-6-astra", providers, true},
 		{"thinking_suffix", alphaSearchSourceFormat, "gpt-5.6-terra(xhigh)", providers, true},
-		{"credential_prefix", alphaSearchSourceFormat, "team/gpt-5.6-luna", providers, true},
+		{"credential_prefix_not_routed", alphaSearchSourceFormat, "team/gpt-5.6-luna", providers, false},
+		{"credential_prefix_with_suffix_not_routed", alphaSearchSourceFormat, "team/gpt-5.6-luna(high)", providers, false},
+		{"suffix_cut_at_last_paren", alphaSearchSourceFormat, "gpt-5.6-sol(x)(xhigh)", providers, false},
+		{"unbalanced_suffix", alphaSearchSourceFormat, "gpt-5.6-sol)", providers, false},
 		{"format_case_and_space", " Codex-Alpha-Search ", "gpt-5.6-sol", providers, true},
 		{"provider_case", alphaSearchSourceFormat, "gpt-5.6-sol", []string{" CODEX "}, true},
 		{"native_model", alphaSearchSourceFormat, "gpt-6-sol", providers, false},
@@ -106,14 +109,13 @@ func TestAlphaSearchRouteDisabledByDefault(t *testing.T) {
 	}
 }
 
-// 任何畸形输入都返回「不处理」，绝不返回错误（错误会让 CPA 记警告；panic 会熔断插件）。
+// 无法解析出判定字段的输入返回「不处理」，绝不返回错误（错误会让 CPA 记警告；panic 会熔断插件）。
 func TestAlphaSearchRouteNeverFails(t *testing.T) {
 	svc := routeServiceWith(alphaSearchConfig())
 	for _, raw := range []string{
 		``, `null`, `[]`, `"text"`, `{`, `{"SourceFormat":123}`,
 		`{"SourceFormat":"codex-alpha-search","RequestedModel":{"x":1}}`,
 		`{"SourceFormat":"codex-alpha-search","RequestedModel":"gpt-5.6-sol","AvailableProviders":"codex"}`,
-		`{"SourceFormat":"codex-alpha-search","RequestedModel":"gpt-5.6-sol","Body":"not-base64!"}`,
 	} {
 		result, err := svc.Handle("model.route", json.RawMessage(raw))
 		if err != nil {
@@ -184,7 +186,44 @@ func TestAlphaSearchModelValidation(t *testing.T) {
 	}
 }
 
+// 判定只依赖 SourceFormat / RequestedModel / AvailableProviders：请求体不解码，异常的
+// Body 不影响结果（CPA 总是发送合法 base64）。
+func TestAlphaSearchRouteIgnoresBody(t *testing.T) {
+	svc := routeServiceWith(alphaSearchConfig())
+	raw := `{"SourceFormat":"codex-alpha-search","RequestedModel":"gpt-5.6-sol","AvailableProviders":["codex"],"Body":"not-base64!"}`
+	result, err := svc.Handle("model.route", json.RawMessage(raw))
+	if err != nil || result.(map[string]any)["Handled"] != true {
+		t.Fatalf("routing must not depend on the body: %v %v", result, err)
+	}
+}
+
+// 与 CPA 的档位后缀规则一致：从最后一个 "(" 截断，含括号的别名附加档位后仍可识别。
+func TestStripThinkingSuffixMatchesCPA(t *testing.T) {
+	for in, want := range map[string]string{
+		"gpt-5.6-sol":           "gpt-5.6-sol",
+		"gpt-5.6-sol(xhigh)":    "gpt-5.6-sol",
+		" gpt-5.6-sol (high) ":  "gpt-5.6-sol",
+		"alias(beta)(xhigh)":    "alias(beta)",
+		"(xhigh)":               "(xhigh)",
+		"gpt-5.6-sol)":          "gpt-5.6-sol)",
+		"team/gpt-5.6-sol(low)": "team/gpt-5.6-sol",
+	} {
+		if got := stripThinkingSuffix(in); got != want {
+			t.Fatalf("stripThinkingSuffix(%q)=%q want %q", in, got, want)
+		}
+	}
+	cfg := defaultConfig()
+	cfg.Models = []string{"alias(beta)"}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !isUnprefixedBasisPointsModel("alias(beta)(xhigh)", cfg) {
+		t.Fatal("alias containing parentheses not recognized with a thinking suffix")
+	}
+}
+
 // 声明路由后每个请求都会经过 model.route，且带着完整请求体：判定不能随请求体变慢太多。
+// 只衡量插件侧 Handle；不含 CPA 克隆请求体、RPC 编码与跨 cgo 调用的开销。
 func BenchmarkAlphaSearchRouteLargeBody(b *testing.B) {
 	svc := routeServiceWith(alphaSearchConfig())
 	body := []byte(`{"model":"gpt-5.6-sol","input":"` + strings.Repeat("x", 1<<20) + `"}`)
