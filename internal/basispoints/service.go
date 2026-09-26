@@ -260,6 +260,8 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 		return authRefresh(raw)
 	case "model.register", "model.static", "model.for_auth":
 		return modelRegistration(s.config()), nil
+	case "model.route":
+		return s.routeModel(raw), nil
 	case "response.intercept_after":
 		return s.interceptModelCatalog(raw)
 	case "executor.execute":
@@ -562,6 +564,7 @@ func registration(cfg Config) map[string]any {
 				{"Name": "transport", "Type": "string", "Description": "上游传输方式：http（默认，缓冲回放）或 ws（WebSocket）。"},
 				{"Name": "proxy_url", "Type": "string", "Description": "WS 传输的出站代理 URL（仅 transport=ws 生效；http 传输走 CPA 全局 proxy-url），留空表示直连。"},
 				{"Name": "heartbeat_seconds", "Type": "integer", "Description": "流式心跳间隔（秒），默认 15；0 关闭。防止长回合被下游空闲超时切断。"},
+				{"Name": "alpha_search_model", "Type": "string", "Description": "Basis Points 模型的 Codex 网页搜索（/v1/alpha/search）改由原生 codex 凭据处理时，用于挑选凭据的原生模型名（如 gpt-6-luna）；留空关闭。不能填 Basis Points 模型。"},
 			},
 		},
 		"capabilities": map[string]any{
@@ -573,6 +576,9 @@ func registration(cfg Config) map[string]any {
 			"executor_output_formats": []string{"openai-response"},
 			"response_interceptor":    true,
 			"management_api":          false,
+			// 只在配置了网页搜索改道时声明：声明后 CPA 每个请求都会先调用 model.route。
+			// reconfigure 时 CPA 会按新注册结果重建能力，开关可热生效。
+			"model_router": cfg.AlphaSearchModel != "",
 		},
 		"config": cfg,
 	}

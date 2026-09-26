@@ -65,6 +65,13 @@ plugins:
       # 范围 0～120，默认 15。
       heartbeat_seconds: 15
 
+      # Codex 网页搜索改道（默认关闭）。codex-tui 的网页搜索单独请求 /v1/alpha/search，CPA 只用
+      # 原生 codex 凭据处理它，Basis Points 模型会得到 auth_not_found（503）。填一个原生 codex
+      # 能提供的模型名后，Basis Points 模型的搜索请求改由同一账号的原生记录处理（消耗原生额度），
+      # 该模型名只用于挑选凭据。不能填 Basis Points 模型。关闭时设为 ""（不要删除该键，
+      # 否则 settings.json 镜像会补回旧值）。开启后 CPA 每个请求都会先询问插件一次路由。
+      # alpha_search_model: gpt-6-luna
+
       # 使用 Basis Points 的凭据文件名：auth-dir 内的裸文件名，原样精确匹配，区分大小写。
       # 条目不得含路径分隔符、空白或控制字符，也不得重复；否则插件拒绝加载。
       # 命中的文件以「共享模式」加载：native codex 与 oai-basispoints 两条记录都保留（原生模型
