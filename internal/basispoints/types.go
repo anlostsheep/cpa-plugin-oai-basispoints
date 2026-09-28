@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version        = "0.1.15"
+	Version        = "0.1.16.0"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -28,11 +28,11 @@ const (
 	DefaultUABrands      = "Google Chrome,Not_A Brand,Chromium"
 	DefaultChromeVersion = "153.0.0.0"
 
-	// TransportHTTP 保持 v0.1.10 的一次性缓冲 HTTP 行为；TransportWS 走 WebSocket。
+	// TransportHTTP：message 正文增量交付，工具/推理终态回放；TransportWS 走 WebSocket，整轮回放。
 	TransportHTTP = "http"
 	TransportWS   = "ws"
 
-	// DefaultHeartbeatSeconds：流式缓冲期间向客户端发送 response.in_progress 心跳的间隔，
+	// DefaultHeartbeatSeconds：流式期间无输出时向客户端发送 response.in_progress 心跳的间隔，
 	// 需小于 sub2api stream_data_interval_timeout(180s) 与 Codex 空闲超时(300s)。0 关闭心跳。
 	DefaultHeartbeatSeconds = 15
 	maxHeartbeatSeconds     = 120
@@ -269,7 +269,7 @@ func (c *Config) normalize() error {
 		c.ChromeVersion = DefaultChromeVersion
 	}
 
-	// 传输方式：仅支持 http 与 ws，默认 http，保持 v0.1.10 行为不变。
+	// 传输方式：仅支持 http 与 ws，默认 http（正文增量交付，工具/推理终态回放）。
 	c.Transport = strings.ToLower(strings.TrimSpace(c.Transport))
 	switch c.Transport {
 	case "":

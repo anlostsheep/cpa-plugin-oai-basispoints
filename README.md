@@ -32,7 +32,7 @@ plugins:
 3. 在插件配置 `dedicated_auth_files` 中列出要使用 Basis Points 的 `type: codex` OAuth 文件名（auth-dir 内的裸文件名）。只有列出的文件会被插件接管；插件只在内存中读取 token，不生成另一份 token 文件。列出的文件需配套外部刷新脚本（见下文）。
 4. 客户端使用 Responses 协议调用 `gpt-6-astra-basispoints`。模型目录声明图像输入，以及 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 思考等级；`max` 映射为 `xhigh`，`ultra` 原样传递，未指定时默认 `medium`。
 
-插件的 `auth.parse` 只接管 `dedicated_auth_files` 中列出的 `type: codex` OAuth 文件，并以「共享模式」展开两条内存认证：一条保留原生 `codex`（现有 Codex 模型继续使用 CPA 原生执行器），另一条是 `oai-basispoints` 虚拟认证。两条记录都**不携带 refresh_token**，因此 CPA 不会轮换该凭据（**前提：CPA 未以 Home 控制面模式运行**，即启动参数没有 `-home-jwt`；Home 刷新不依赖 refresh_token，启用 Home 时不要使用本模式）；刷新由外部脚本独占完成（fork 仓库配套 `cpa-codex-token-refresh`），脚本原子改写文件后，CPA 重新加载，两条记录同时拿到新的 access token。两条记录都由 CPA 标为 `plugin_virtual`，CPA 不会把它们写回 OAuth 文件；只有虚拟记录额外标记 `runtime_only`，native 记录保持可在面板上刷新额度、重置额度。未列出的 codex 文件插件不接管，由 CPA 原生加载、刷新并写回，也不提供 Basis Points 模型。之所以这样设计：CPA 会把插件展开出的多条记录都标记为虚拟认证、不持久化刷新结果，若由 CPA 刷新，新的 refresh_token 只留在内存，文件中的旧值随即作废，重启后凭据失效。流式响应遵循 Responses SSE 格式，但为保证工具调用可在完整 item 上做安全转换，当前会先读完上游 SSE 再回放给客户端，不是 token 级实时转发。
+插件的 `auth.parse` 只接管 `dedicated_auth_files` 中列出的 `type: codex` OAuth 文件，并以「共享模式」展开两条内存认证：一条保留原生 `codex`（现有 Codex 模型继续使用 CPA 原生执行器），另一条是 `oai-basispoints` 虚拟认证。两条记录都**不携带 refresh_token**，因此 CPA 不会轮换该凭据（**前提：CPA 未以 Home 控制面模式运行**，即启动参数没有 `-home-jwt`；Home 刷新不依赖 refresh_token，启用 Home 时不要使用本模式）；刷新由外部脚本独占完成（fork 仓库配套 `cpa-codex-token-refresh`），脚本原子改写文件后，CPA 重新加载，两条记录同时拿到新的 access token。两条记录都由 CPA 标为 `plugin_virtual`，CPA 不会把它们写回 OAuth 文件；只有虚拟记录额外标记 `runtime_only`，native 记录保持可在面板上刷新额度、重置额度。未列出的 codex 文件插件不接管，由 CPA 原生加载、刷新并写回，也不提供 Basis Points 模型。之所以这样设计：CPA 会把插件展开出的多条记录都标记为虚拟认证、不持久化刷新结果，若由 CPA 刷新，新的 refresh_token 只留在内存，文件中的旧值随即作废，重启后凭据失效。流式响应遵循 Responses SSE 格式：http 传输下 message 正文边读边转发（逐段增量）；工具调用需在完整 item 上做安全转换，与推理、推理摘要一起在终态整批回放；ws 传输仍先读完上游再回放。`heartbeat_seconds: 0` 只关闭心跳，不影响正文增量。
 
 ## 构建
 
@@ -41,8 +41,13 @@ make test
 make build
 ```
 
+## 版本号
+
+本 fork 自 `0.1.16.0` 起使用**四段纯数字**版本号 `<主>.<次>.<修订>.<fork 序号>`（如 `0.1.16.0`、`0.1.16.1`），tag 为 `v` 加版本号，并与 `internal/basispoints/types.go` 的 `Version` 一致（release 工作流会校验）。原因：CPA 插件商店只对全数字点分版本比较大小，带后缀的版本号会被当作「不同即更新」；原仓库始终用三段版本号，四段 tag 不会与之重名。
+
 ## 协议边界
 
+- http 流式下 message 正文边读边转发；工具调用、推理与推理摘要在终态整批给出，终态须与已转发正文一致。
 - 上游请求始终带 `Authorization: Bearer <access_token>`、`chatgpt-account-id`、`x-openai-account-id` 和 `x-basispoints-auth-mode: chatgpt`。
 - `turn_id` 按会话和当前用户 turn 稳定生成；工具结果回合只递增 `agent_iteration`，不会把同一 turn 重新当成新计划。
 - 工具 `code` 是嵌套 JSON 字符串，不是 JavaScript。插件只解析它，不执行其中内容。

@@ -202,10 +202,11 @@ func (s *Service) readErrorBody(stream upstreamStream, g *upstreamGuard) ([]byte
 	var mu sync.Mutex
 	var partial []byte
 	go func() {
-		_, err := s.readGuardedInto(stream, g, func(chunk []byte) {
+		_, err := s.readGuardedInto(stream, g, func(chunk []byte) error {
 			mu.Lock()
 			partial = append(partial, chunk...)
 			mu.Unlock()
+			return nil
 		})
 		result <- err
 	}()
@@ -251,8 +252,9 @@ func (s *Service) readGuarded(stream upstreamStream, g *upstreamGuard) ([]byte, 
 	return s.readGuardedInto(stream, g, nil)
 }
 
-// readGuardedInto 同 readGuarded，并在每个数据块到达时回调 onChunk（可为 nil）。
-func (s *Service) readGuardedInto(stream upstreamStream, g *upstreamGuard, onChunk func([]byte)) ([]byte, error) {
+// readGuardedInto 同 readGuarded，并在每个数据块到达时回调 onChunk（可为 nil）；onChunk 返回
+// 错误即中止读取（例如增量交付时客户端已断开或上游事件不一致），不再发起下一次 stream_read。
+func (s *Service) readGuardedInto(stream upstreamStream, g *upstreamGuard, onChunk func([]byte) error) ([]byte, error) {
 	cfg := s.config()
 	if stream.StreamID == "" {
 		return nil, fail(502, "upstream_transport", "upstream stream ID is empty")
@@ -279,7 +281,19 @@ func (s *Service) readGuardedInto(stream upstreamStream, g *upstreamGuard, onChu
 			}
 			_, _ = buffer.Write(chunk.Payload)
 			if onChunk != nil {
-				onChunk(chunk.Payload)
+				// onChunk 可能阻塞（向下游交付正文）：期间守卫若已记录超时/停止，这一原因优先于
+				// 回调随后报告的解析/一致性错误，也不能把这一块（尤其 Done 块）当作成功读完。
+				// 客户端断开例外：立即静默结束。
+				chunkErr := onChunk(chunk.Payload)
+				if chunkErr != nil && (errors.Is(chunkErr, errClientDisconnected) || isKind(chunkErr, "client_disconnected")) {
+					return nil, chunkErr
+				}
+				if err := g.aborted(); err != nil {
+					return nil, err
+				}
+				if chunkErr != nil {
+					return nil, chunkErr
+				}
 			}
 		}
 		if chunk.Done {

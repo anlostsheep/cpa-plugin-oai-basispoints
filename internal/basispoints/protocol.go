@@ -976,6 +976,13 @@ func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
 				field, event = "input", "response.custom_tool_call_input"
 			}
 			added := cloneObject(item)
+			isMessage := stringValue(item["type"]) == "message"
+			if isMessage {
+				// 与上游 #12 一致：message 先以空内容开场，再逐段给出 content_part / output_text 事件，
+				// 客户端按事件（而非 added 里的全量 content）组装正文。
+				added["status"] = "in_progress"
+				added["content"] = []any{}
+			}
 			if field != "" {
 				added[field] = ""
 				if field == "arguments" {
@@ -989,6 +996,8 @@ func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
 					add(event+".delta", map[string]any{"output_index": index, "item_id": item["id"], "delta": text})
 				}
 				add(event+".done", map[string]any{"output_index": index, "item_id": item["id"], field: text})
+			} else if isMessage {
+				events = append(events, messageContentEvents(index, item)...)
 			}
 			add("response.output_item.done", map[string]any{"output_index": index, "item": item})
 		}
@@ -1005,6 +1014,41 @@ func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
 }
 
 // renderSSE 为事件依次赋 sequence_number（从 start 开始）并序列化；返回下一个序号。
+// messageContentEvents 为已完成的 message 逐段生成 content_part / output_text 事件（移植自上游
+// JaxsonWang/cpa-plugin-oai-basispoints #12 emitMessageContent，MIT）。
+func messageContentEvents(outputIndex int, item map[string]any) []sseEvent {
+	content, _ := item["content"].([]any)
+	events := make([]sseEvent, 0, len(content)*4)
+	for contentIndex, value := range content {
+		part := objectValue(value)
+		if part == nil {
+			continue
+		}
+		added := cloneObject(part)
+		text, isText := part["text"].(string)
+		isText = isText && stringValue(part["type"]) == "output_text"
+		if isText {
+			added["text"] = ""
+			if _, exists := added["logprobs"]; exists {
+				added["logprobs"] = []any{}
+			}
+		}
+		events = append(events, sseEvent{name: "response.content_part.added", value: map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "part": added}})
+		if isText {
+			logprobs, _ := part["logprobs"].([]any)
+			if logprobs == nil {
+				logprobs = []any{}
+			}
+			if text != "" {
+				events = append(events, sseEvent{name: "response.output_text.delta", value: map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "delta": text, "logprobs": logprobs}})
+			}
+			events = append(events, sseEvent{name: "response.output_text.done", value: map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "text": text, "logprobs": logprobs}})
+		}
+		events = append(events, sseEvent{name: "response.content_part.done", value: map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "part": part}})
+	}
+	return events
+}
+
 func renderSSE(events []sseEvent, start int, done bool) ([]byte, int) {
 	var builder strings.Builder
 	sequence := start

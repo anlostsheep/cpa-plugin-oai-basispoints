@@ -10,11 +10,12 @@ import (
 
 // streamSession 管理一次 executor.execute_stream 的下游输出，供 http 与 ws 两种传输共用。
 //
-// 背景：两种传输都要等上游完整回复（需在完整 item 上安全转换工具调用）后才回放，缓冲期间
-// 下游收不到任何字节，长回合会被 sub2api stream_data_interval_timeout(180s) 或 Codex
-// 空闲超时(300s) 切断。会话在开始时立即发出 response.created，并在缓冲期间按间隔发送
-// response.in_progress 心跳；心跳 emit 失败即视为客户端已断开，立刻回调 onDisconnect
-// 取消上游（ws 会据此发送 basispoints.response.cancel）。
+// 背景：工具调用需在完整 item 上安全转换，推理也在终态整批给出；ws 传输整轮缓冲，http 传输
+// 只提前交付 message 正文（streamDelivery 经 deliver 写入本会话）。没有输出的期间下游收不到
+// 字节，长回合会被 sub2api stream_data_interval_timeout(180s) 或 Codex 空闲超时(300s) 切断。
+// 会话开流（立即，或 http 已建连时等上游 response.created / 首次空闲心跳）后，在最近半个间隔
+// 没有输出时发送 response.in_progress 心跳；emit 失败即视为客户端已断开，立刻回调
+// onDisconnect 取消上游（ws 会据此发送 basispoints.response.cancel）。
 //
 // 失败语义（#6）：host.stream.close 的 error 只是一段字符串、不带状态码，CPA 一律按瞬时
 // 错误冷却凭据。因此只有凭据/限流/传输类错误带 error 关闭，交给 CPA 处理；属于「本次
@@ -29,9 +30,10 @@ type streamSession struct {
 
 	mu           sync.Mutex
 	sequence     int
-	started      bool
+	started      bool // 已开流：开场事件已发出，客户端 response id 固定
 	closed       bool
 	disconnected bool
+	lastEmit     time.Time // 最近一次成功输出，心跳据此只在空闲时发送
 
 	stopHeartbeat chan struct{}
 	heartbeatDone chan struct{}
@@ -80,8 +82,42 @@ func (ss *streamSession) bindLifecycle(ctx context.Context) {
 
 // forceClose 不持有 ss.mu（阻塞中的 emit 正持有它），直接关闭宿主流以解除阻塞。
 func (ss *streamSession) forceClose() {
-	ss.forced.Store(true)
-	ss.closeStream(nil)
+	ss.abortDownstream(nil)
+}
+
+// abortDownstream 不持有 ss.mu，直接关闭宿主流（err 非 nil 时带 error，交给 CPA 按超时等处理）。
+// 用于下游不读、emit 阻塞在宿主队列上时解除阻塞；之后会话不再 emit，close 恰好一次。
+// forced 在赢得 closeOnce 之后才发布：任何路径看到 forced，关闭权与关闭原因都已归本次强关，
+// 不会有收尾路径抢先以 nil 关闭而丢失 err。
+func (ss *streamSession) abortDownstream(err error) {
+	ss.closeWith(err, true)
+}
+
+// streamDeadlineGrace 是请求截止时间之后留给正常超时路径（守卫关上游 → 会话带 error 关流）
+// 的宽限；仍未结束说明 emit 阻塞在下游，由截止看门狗直接关闭下游流。
+var streamDeadlineGrace = time.Second
+
+// bindDeadline 在请求截止时间（首次往返与重新生成共享）加宽限后仍未结束时，以 err 关闭下游流。
+// 守卫超时只能取消上游，无法解除持锁阻塞中的下游 emit（正文增量或心跳写满宿主队列时）。
+func (ss *streamSession) bindDeadline(deadline time.Time, err error) {
+	if deadline.IsZero() {
+		return
+	}
+	grace := streamDeadlineGrace
+	go func() {
+		timer := time.NewTimer(time.Until(deadline) + grace)
+		defer timer.Stop()
+		select {
+		case <-ss.ended:
+		case <-timer.C:
+			// 插件已停止时按 shutdown 处理（静默强关，不带 error），避免被报成超时而冷却凭据。
+			if ss.lifeCtx != nil && stoppedByShutdown(ss.lifeCtx) {
+				ss.abortDownstream(nil)
+				return
+			}
+			ss.abortDownstream(err)
+		}
+	}()
 }
 
 func (ss *streamSession) markEnded() {
@@ -123,25 +159,88 @@ func (ss *streamSession) emitLocked(events []sseEvent, done bool) error {
 		return errClientDisconnected
 	}
 	ss.sequence = next
+	ss.lastEmit = time.Now()
 	return nil
+}
+
+// openLocked 发出开场事件（response.created + response.in_progress）并固定客户端 response id；
+// 调用方持有 ss.mu，已开流时不做任何事。meta 为上游 response.created 的响应对象：带 id 时
+// 客户端全程使用上游 id；为 nil 时使用会话合成的 resp_bp_ id。开场对象不携带 error 字段
+// （CPA 会把带非空 error 的帧当作终态错误）。
+func (ss *streamSession) openLocked(meta map[string]any) error {
+	if ss.started {
+		return nil
+	}
+	prologue := ss.placeholderResponse("in_progress")
+	if id := stringValue(meta["id"]); id != "" {
+		ss.responseID = id
+		prologue = cloneObject(meta)
+		delete(prologue, "error")
+		prologue["status"], prologue["output"] = "in_progress", []any{}
+	}
+	ss.started = true
+	return ss.emitLocked([]sseEvent{
+		{name: "response.created", value: map[string]any{"response": prologue}},
+		{name: "response.in_progress", value: map[string]any{"response": cloneObject(prologue)}},
+	}, false)
+}
+
+// open 在得知上游 response id 时以该 id 开流（仅心跳开启时；心跳关闭保持不提前输出）。
+func (ss *streamSession) open(meta map[string]any) {
+	if ss.heartbeat <= 0 {
+		return
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.closed || ss.disconnected || ss.forced.Load() {
+		return
+	}
+	_ = ss.openLocked(meta)
+}
+
+// deliver 交付增量消息事件：尚未开流时先以 meta 开场，再按会话序号写出 frames。
+func (ss *streamSession) deliver(meta map[string]any, frames []map[string]any) error {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.closed || ss.disconnected || ss.forced.Load() {
+		return errClientDisconnected
+	}
+	if err := ss.openLocked(meta); err != nil {
+		return err
+	}
+	events := make([]sseEvent, 0, len(frames))
+	for _, frame := range frames {
+		events = append(events, sseEvent{name: stringValue(frame["type"]), value: frame})
+	}
+	return ss.emitLocked(events, false)
 }
 
 var errClientDisconnected = errors.New("client disconnected while receiving stream")
 
-// start 立即发出 response.created + response.in_progress，并启动心跳。heartbeat<=0 时
-// 不做任何提前输出，保持 v0.1.10 的一次性回放行为。
+// start 立即以会话合成 id 开流并启动心跳（上游建连超过同步窗口、以及 ws 传输）。
+// heartbeat<=0 时不提前开流、不发心跳（http 正文增量仍由 deliver 在 commit 时开流交付）。
 func (ss *streamSession) start() {
 	if ss.heartbeat <= 0 {
 		return
 	}
 	ss.mu.Lock()
-	ss.started = true
-	_ = ss.emitLocked([]sseEvent{
-		{name: "response.created", value: map[string]any{"response": ss.placeholderResponse("in_progress")}},
-		{name: "response.in_progress", value: map[string]any{"response": ss.placeholderResponse("in_progress")}},
-	}, false)
+	_ = ss.openLocked(nil)
 	ss.mu.Unlock()
+	ss.runHeartbeat()
+}
 
+// startIdle 只启动心跳、不立即开流（上游已在同步窗口内建连）：收到上游 response.created
+// 时以上游 id 开流；若首次空闲心跳先到，则以合成 id 开流。
+func (ss *streamSession) startIdle() {
+	if ss.heartbeat <= 0 {
+		return
+	}
+	ss.runHeartbeat()
+}
+
+// runHeartbeat 按间隔检查：未开流则开流；已开流且最近半个间隔内没有任何输出才发
+// response.in_progress（有正文增量持续输出时不插入心跳）。
+func (ss *streamSession) runHeartbeat() {
 	ss.stopHeartbeat = make(chan struct{})
 	ss.heartbeatDone = make(chan struct{})
 	go func() {
@@ -154,9 +253,15 @@ func (ss *streamSession) start() {
 				return
 			case <-ticker.C:
 				ss.mu.Lock()
-				err := ss.emitLocked([]sseEvent{
-					{name: "response.in_progress", value: map[string]any{"response": ss.placeholderResponse("in_progress")}},
-				}, false)
+				var err error
+				switch {
+				case !ss.started:
+					err = ss.openLocked(nil)
+				case time.Since(ss.lastEmit) >= ss.heartbeat/2:
+					err = ss.emitLocked([]sseEvent{
+						{name: "response.in_progress", value: map[string]any{"response": ss.placeholderResponse("in_progress")}},
+					}, false)
+				}
 				ss.mu.Unlock()
 				if err != nil {
 					return
@@ -175,7 +280,15 @@ func (ss *streamSession) stop() {
 }
 
 func (ss *streamSession) closeStream(err error) {
+	ss.closeWith(err, false)
+}
+
+// closeWith 恰好一次地关闭宿主流；force 为真时在关闭前发布 forced（仅当本次赢得关闭权）。
+func (ss *streamSession) closeWith(err error, force bool) {
 	ss.closeOnce.Do(func() {
+		if force {
+			ss.forced.Store(true)
+		}
 		payload := map[string]any{"stream_id": ss.streamID}
 		if err != nil {
 			payload["error"] = safeError(err)
@@ -184,8 +297,13 @@ func (ss *streamSession) closeStream(err error) {
 	})
 }
 
-// finish 回放已转换的完整响应并正常关闭。心跳开启时 id 统一为会话 id，并省略已发出的开场事件。
+// finish 回放已转换的完整响应并正常关闭。已开流时 id 统一为会话 id，并省略已发出的开场事件。
 func (ss *streamSession) finish(response map[string]any) {
+	ss.finishWith(response, nil)
+}
+
+// finishWith 同 finish；keep 非 nil 时（增量交付已 commit）只回放 keep 保留的事件。
+func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent) bool) {
 	defer ss.markEnded()
 	ss.stop()
 	ss.mu.Lock()
@@ -205,6 +323,15 @@ func (ss *streamSession) finish(response map[string]any) {
 		aligned := cloneObject(response)
 		aligned["id"] = ss.responseID
 		events = syntheticEvents(aligned, false)
+		if keep != nil {
+			kept := events[:0]
+			for i := range events {
+				if keep(&events[i]) {
+					kept = append(kept, events[i])
+				}
+			}
+			events = kept
+		}
 	} else {
 		events = syntheticEvents(response, true)
 	}

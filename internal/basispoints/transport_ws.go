@@ -411,6 +411,7 @@ func (s *Service) executeStreamWS(request ExecutorRequest, body map[string]any, 
 				session.fail(transformErr)
 				return
 			}
+			s.logRegenerate(request, "ws", true, transformErr)
 			// 重新生成一次：新连接、新 response.create，同一 ctx（断开/停止/总超时）约束。
 			body = retry
 			if turn, err = s.openWSTurn(ctx, body, c); err != nil {

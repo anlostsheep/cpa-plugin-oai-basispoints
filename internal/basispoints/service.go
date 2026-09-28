@@ -1,6 +1,7 @@
 package basispoints
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -329,6 +330,7 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 		if !ok {
 			return nil, err
 		}
+		s.logRegenerate(request, "http", false, err)
 		body = retry
 	}
 }
@@ -380,7 +382,7 @@ func streamHeaders() map[string]any {
 //     的错误，CPA 能按 401/403/429 正确换号或冷却（绝大多数凭据/限流错误都在此窗口内）。
 //   - grace 到期仍未完成：返回 nil，调用方先把流交给宿主并开始心跳，防止 sub2api(180s)
 //     空闲超时；之后的建连失败只能以无状态码的流错误关闭（已接受的折中）。
-//   - grace<=0（心跳关闭）：同步等到建连完成，保持 v0.1.10 行为。
+//   - grace<=0（心跳关闭）：同步等到建连完成；不提前开流（http 正文增量仍照常交付）。
 func awaitConnect[T any](grace time.Duration, connected <-chan T, headers <-chan struct{}) *T {
 	if grace <= 0 {
 		result := <-connected
@@ -453,9 +455,15 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 		stopOnce.Do(func() { close(stop) })
 	})
 	session.bindLifecycle(runCtx)
+	session.bindDeadline(request.deadline, timeoutError(cfg))
 	go func() {
 		defer done()
-		session.start()
+		if early != nil {
+			// 已在同步窗口内建连：等上游 response.created 以上游 id 开流（首次空闲心跳先到则用合成 id）。
+			session.startIdle()
+		} else {
+			session.start()
+		}
 		var upstream upstreamStream
 		if early != nil {
 			upstream = early.upstream
@@ -475,9 +483,16 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 			return
 		}
 		for attempt := 0; ; attempt++ {
-			raw, readErr := s.readGuarded(upstream, guard)
+			// 每次往返一台新的增量交付状态机；客户端 response id 由会话固定，不随重新生成改变。
+			delivery := newStreamDelivery(session.open, session.deliver)
+			feeder := newIncrementalFeeder(delivery)
+			raw, readErr := s.readGuardedInto(upstream, guard, feeder.feed)
 			// release 等待看守协程退出并关闭上游流；此后本往返不再有守卫发起的宿主回调。
 			guard.release()
+			if readErr == nil {
+				// EOF：处理最后一个没有空行结尾的事件，让它同样经过状态机校验。
+				readErr = feeder.flush()
+			}
 			if readErr != nil {
 				session.fail(readErr)
 				return
@@ -487,10 +502,33 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				session.fail(parseErr)
 				return
 			}
+			// 先核对终态与已交付正文一致，再做工具整批转换（转换会写入历史身份缓存）。
+			if err := delivery.validateFinal(response); err != nil {
+				session.fail(err)
+				return
+			}
+			if !delivery.committed && delivery.events > 0 && hasMessageText(response) {
+				// 有 SSE 事件和正文却没有增量交付（上游未按 created/item/part 顺序给出）：退回终态回放。
+				s.logEvent(request, "info", "basispoints: message text replayed at terminal without incremental delivery", map[string]any{
+					"transport": "http", "upstream_events": delivery.events,
+				})
+			}
 			_, transformedResponse, _, transformErr := transformResponseBody(jsonBytes(response), source)
 			if transformErr == nil {
-				// finish 在持锁的最终输出边界再次检查本代是否已停止。
-				session.finish(transformedResponse)
+				// finish 在持锁的最终输出边界再次检查本代是否已停止；已 commit 时只补发未交付部分。
+				if delivery.committed {
+					session.finishWith(transformedResponse, delivery.keepFinal)
+				} else {
+					session.finish(transformedResponse)
+				}
+				return
+			}
+			if delivery.committed {
+				// 正文已交付给客户端：不能重新生成（会重复输出），直接以请求级失败结束。
+				s.logEvent(request, "warn", "basispoints: tool call invalid after text was delivered; not regenerating", map[string]any{
+					"transport": "http", "kind": errorKind(transformErr),
+				})
+				session.fail(transformErr)
 				return
 			}
 			retry, ok := relayRetryBody(body, response, transformErr, attempt)
@@ -498,6 +536,7 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				session.fail(transformErr)
 				return
 			}
+			s.logRegenerate(request, "http", true, transformErr)
 			// 重新生成一次：新的往返使用新的守卫，同样受客户端断开、插件停止约束，超时只剩
 			// 首次往返用剩的时长；心跳在此期间继续保活。此时下游流已开启，本次往返的失败
 			// （含 401/403/429）只能以无状态码的流错误关闭，与延迟心跳的既有折中一致。
@@ -518,6 +557,80 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 		}
 	}()
 	return streamHeaders(), nil
+}
+
+// logEvent 尽力写一条宿主日志（CPA 日志，宿主附 request_id）；失败忽略，绝不影响请求。
+// 只记录类别与计数，不记录请求或响应内容。
+func (s *Service) logEvent(request ExecutorRequest, level, message string, fields map[string]any) {
+	payload := map[string]any{"level": level, "message": message, "fields": fields}
+	if request.HostCallbackID != "" {
+		payload["host_callback_id"] = request.HostCallbackID
+	}
+	_ = s.call("host.log", payload, nil)
+}
+
+// logRegenerate 记录一次工具调用格式错误触发的重新生成（插件内部行为，CPA 看不到）。
+func (s *Service) logRegenerate(request ExecutorRequest, transport string, stream bool, err error) {
+	s.logEvent(request, "info", "basispoints: regenerating once after invalid tool call", map[string]any{
+		"transport": transport, "stream": stream, "kind": errorKind(err),
+	})
+}
+
+// hasMessageText 判断终态里是否有非空的 message 正文。
+func hasMessageText(response map[string]any) bool {
+	output, _ := response["output"].([]any)
+	for _, value := range output {
+		item := objectValue(value)
+		if stringValue(item["type"]) != "message" {
+			continue
+		}
+		content, _ := item["content"].([]any)
+		for _, part := range content {
+			if text, _ := objectValue(part)["text"].(string); text != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// incrementalFeeder 是 readGuardedInto 的分块回调：按首个非空白字节判别 JSON / SSE，
+// SSE 逐块解码并交给增量交付状态机；JSON 响应只缓冲、不做增量。
+type incrementalFeeder struct {
+	delivery *streamDelivery
+	decoder  *sseDecoder
+	head     []byte
+	detected bool
+	sse      bool
+}
+
+func newIncrementalFeeder(delivery *streamDelivery) *incrementalFeeder {
+	return &incrementalFeeder{delivery: delivery, decoder: newSSEDecoder()}
+}
+
+func (f *incrementalFeeder) feed(chunk []byte) error {
+	data := chunk
+	if !f.detected {
+		f.head = append(f.head, chunk...)
+		trimmed := bytes.TrimSpace(f.head)
+		if len(trimmed) == 0 {
+			return nil
+		}
+		f.detected, f.sse = true, trimmed[0] != '{'
+		data, f.head = f.head, nil
+	}
+	if !f.sse {
+		return nil
+	}
+	return f.decoder.feed(data, f.delivery.consume)
+}
+
+// flush 在正常读完后补一个空行，处理末尾未以空行结束的事件。
+func (f *incrementalFeeder) flush() error {
+	if !f.sse {
+		return nil
+	}
+	return f.decoder.feed([]byte("\n\n"), f.delivery.consume)
 }
 
 func (s *Service) status() map[string]any {
@@ -561,9 +674,9 @@ func registration(cfg Config) map[string]any {
 				{"Name": "ua_platform", "Type": "string", "Description": "x-openai-internal-basispoints-browser-ua-platform 的值，默认 macOS。"},
 				{"Name": "ua_brands", "Type": "string", "Description": "x-openai-internal-basispoints-browser-ua-brands 的值。"},
 				{"Name": "chrome_version", "Type": "string", "Description": "浏览器主版本号，默认 153.0.0.0。"},
-				{"Name": "transport", "Type": "string", "Description": "上游传输方式：http（默认，缓冲回放）或 ws（WebSocket）。"},
+				{"Name": "transport", "Type": "string", "Description": "上游传输方式：http（默认，正文增量、工具/推理终态回放）或 ws（WebSocket，整轮回放）。"},
 				{"Name": "proxy_url", "Type": "string", "Description": "WS 传输的出站代理 URL（仅 transport=ws 生效；http 传输走 CPA 全局 proxy-url），留空表示直连。"},
-				{"Name": "heartbeat_seconds", "Type": "integer", "Description": "流式心跳间隔（秒），默认 15；0 关闭。防止长回合被下游空闲超时切断。"},
+				{"Name": "heartbeat_seconds", "Type": "integer", "Description": "流式心跳间隔（秒），默认 15；0 关闭（仅关闭心跳，http 正文增量不受影响）。无输出时防止长回合被下游空闲超时切断。"},
 				{"Name": "alpha_search_model", "Type": "string", "Description": "Basis Points 模型的 Codex 网页搜索（/v1/alpha/search）改由原生 codex 凭据处理时，用于挑选凭据的原生模型名（如 gpt-6-luna）；留空关闭。不能填 Basis Points 模型。"},
 			},
 		},

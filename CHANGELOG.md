@@ -1,5 +1,26 @@
 # 更新日志
 
+## v0.1.16.0 — 2026-09-28（UTC）
+
+本版起 fork 使用**四段纯数字版本号**（见 README「版本号」）。增量交付状态机移植自原仓库 JaxsonWang/cpa-plugin-oai-basispoints v0.1.18（`11df6f8`，`stream_events.go`，MIT），消息内容逐段回放移植自原仓库 #12；外层沿用本 fork 的流会话（延迟心跳、失败分类、ws 传输、共享模式凭据），未合并原仓库的 `streaming.go` / `request_lifecycle.go` / `websocket.go`。
+
+### 新增
+
+- **http 流式正文增量交付**：上游 SSE 边读边解析，message 正文（`output_text.delta`）在上游输出后即转发给客户端，不再等整轮结束后一次性回放。前提是上游按 `response.created` → `output_item.added`（message）→ `content_part.added`（`output_text`）→ delta 的顺序给出事件（Basis Points 实测如此）；不满足时退回终态回放，并写一条计数日志。
+  - **工具调用仍在终态整批给出**：`run_officejs` 的名称和参数增量不外发，终态经原有 `transformResponseBody` 转换、校验后随终态回放。只含工具调用的轮次仍要等到终态才有输出，`timeout_seconds` 840 保持不变。
+  - **推理与推理摘要不提前发**：`reasoning` / `reasoning_summary_*` 增量一律不外发，推理 item 在终态整体回放。
+  - **终态一致性核对**：终态的 response id、message 序号/id、正文必须与已交付内容一致（终态正文须以已交付正文为前缀），否则以请求级错误 `invalid_upstream_stream` 结束（`response.failed`），不伪造完成。终态只补发未交付的正文后缀及工具、推理 item。
+  - **重新生成边界**：工具调用格式错误时，只有尚未向客户端交付任何正文才重新生成一次；已交付正文则直接以 `response.failed`（`invalid_tool_call`）结束，避免重复输出。
+  - **失败分类不变**：已开流后，上游流内报告的 401/403/429、传输错误、超时仍带 error 关流，交给 CPA 冷却或换号；请求级错误以 `response.failed` 结束。客户端断开时立即停止读取上游。
+  - 仅 http 传输；`transport: ws` 仍整轮缓冲后回放（留待后续版本）。
+- **计数日志**（经 `host.log` 写入 CPA 日志，带 request_id，只含类别不含内容）：重新生成（http 非流式、http 流式、ws）、正文交付后工具无效、有正文却未能增量交付。
+
+### 变更
+
+- **客户端 response id**：上游已在同步窗口内建连时，不再立即以合成 id 开流，而是在收到上游 `response.created` 时以上游 id 开流；若首次空闲心跳先到，则以合成 `resp_bp_` id 开流并全程使用。建连超过同步窗口时维持原行为（立即以合成 id 开流）。开场事件不携带 `error` 字段。
+- **心跳只在空闲时发送**：最近半个间隔内已有输出（如正文增量）就不插入 `response.in_progress`。
+- **消息回放逐段给出内容**：终态回放（含 ws、缓冲回放）中 message 的 `output_item.added` 以空内容开场，随后给出 `content_part.added` / `output_text.delta` / `output_text.done` / `content_part.done`，与上游事件形态一致。
+
 ## v0.1.15 — 2026-09-26（UTC）
 
 ### 新增
