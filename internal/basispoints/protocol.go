@@ -1036,7 +1036,10 @@ func syntheticEventsFor(response map[string]any, withPrologue, reasoningSummary 
 				added["content"] = []any{}
 			}
 			if isReasoning && reasoningSummary {
+				// 与 live 帧一致：开场不携带密文（阶段快照密文值可不同，不能要求跨阶段相等）；
+				// 完整 item 与密文在下方 output_item.done 给出，与终态 output 的最终值相同。
 				added["summary"] = []any{}
+				delete(added, "encrypted_content")
 			}
 			if field != "" {
 				added[field] = ""
@@ -1072,7 +1075,7 @@ func syntheticEventsFor(response map[string]any, withPrologue, reasoningSummary 
 
 // reasoningSummaryEvents 为 reasoning item 的 summary 逐段生成 reasoning_summary 事件
 // （移植自上游 JaxsonWang/cpa-plugin-oai-basispoints v0.2.9 emitReasoningSummary，MIT）：
-// 非 summary_text 部件跳过，完整 item/密文只在 output_item.done 中给出。
+// 非 summary_text 部件跳过，完整 item/密文在 output_item.done 中给出（与终态 output 同值）。
 func reasoningSummaryEvents(outputIndex int, item map[string]any) []sseEvent {
 	summary, _ := item["summary"].([]any)
 	events := make([]sseEvent, 0, len(summary)*4)

@@ -1,5 +1,29 @@
 # 更新日志
 
+## v0.1.18.1 — 2026-10-02
+
+修复 v0.1.18.0 在真实推理摘要流上的生产事故（`invalid_upstream_stream`），并恢复被该事故连带静默关闭的无摘要流消息增量交付。摘要增量特性保留，密文契约改为「live 帧不携带密文；最终 reasoning `item.done` 恰好一次，其密文与 `completed` / `incomplete`.`output` 同值」。
+
+### 修复
+
+- **移除跨事件密文逐字节相等检查**（生产事故根因）：owner 脱敏捕获显示，同一 reasoning 条目的阶段快照 `output_item.added`、`output_item.done`、`completed.output` 的瞬时 `encrypted_content` 两两不同（ENC0≠ENC1≠ENC2）——阶段快照的密文可不同，不能要求跨阶段字节相等；v0.1.18.0 新增的「added 已交付密文必须与 done/终态逐字节相等」在真实摘要流上不可满足——真实摘要流在 item.done 到达时被请求级 `invalid_upstream_stream` 拒绝（拒绝前已向客户端转发 102 个摘要增量），且该检查失败经 `pendingBroken` 让无摘要流的消息增量也被静默关闭（第二个生产可见回归）。删除的是上游不可满足的「已交付密文不可变」，不是删除负例校验本身。
+- **live 帧不携带密文**：reasoning `output_item.added` 开场在既有 `summary` 归一化处同时剥离 `encrypted_content`（保留 id 与其余字段，含上游预填字段的变体统一处理）；上游 reasoning `output_item.done` 只校验并消费——登记上游已完成状态与摘要快照（`upstreamDone`），不再把该事件转发给客户端。
+- **权威密文随终态交付（最终 item.done 恰好一次）**：终态回放的 reasoning `output_item.done` 恒保留（live 从未交付过），携带完整终态条目，密文与 `completed` / `incomplete`.`output` 中的最终值逐字节一致——同一最终值在 item.done 与 completed/incomplete.output 两个终态事件中都出现，属标准形状；「不重复交付」指 live added/done 的瞬时值不会提前交付或回放，而非密文字段在线上只出现一次。终态缺失或为空时照原样交付，绝不从 added/done 的瞬时值合成、解码或改写。
+- **状态机支持不转发的已消费事件**：事件应用可返回「已消费但不交付」（nil 帧），提交分支与重放批次过滤 nil 帧，不产生 null 事件或空批次，也不把已消费事件误记为正文/摘要交付（`relay_summary` 的 `text_committed` / `summary_committed` 口径不受污染）。
+- **已提交专用生成器同步**：http 已提交增量路径的终态回放生成器（含摘要增量形状）里的 reasoning 开场同样剥离密文、空 `summary` 开场；其余合成形状（ws、buffered、未提交 http、非流式）保持原样。
+
+### 保留
+
+- 身份（response/item id）、摘要前缀与 `textDone` 精确文本、part 生命周期、重复/乱序/迟到与「完成后再来同类事件」等强校验不变；终态核对失败仍是请求级 `invalid_upstream_stream`。
+- 正文与摘要任一首次交付后不再重新生成；工具格式错误、超时、取消、停止都不会补发伪造的 reasoning done/密文/`completed`。
+- buffered 工具回合不提前交付、仍支持交付前一次重新生成与共享截止时间；未满足事件顺序前提时在未交付任何内容前整体退回终态回放。
+- 冷历史重建、用户图片全请求预检、大整数保真、窄口径旧格式兼容、`relay_summary` 独立字段、共享凭据/外部刷新/按凭据代理等 0.1.18.0 行为不变。
+
+### 说明
+
+- 定向回归：密文瞬时值不泄漏、终态密文与 completed.output 同值且最终 item.done 恰好一次、live 开场剥离、无摘要流消息增量不再被静默关闭等检查改写为交付边界断言；新增离线回放 driver（`build/port-upstream-v029/delivery-replay/`，overlay 注入测试构建、不入库、不改业务源码），读取脱敏实际 SSE 路径，按逐事件 / 4 事件组 / 512 字节三种切块策略经真实增量服务路径回放并校验客户端交付。仓库夹具（owner 捕获派生的 asis 与插入摘要的 with-summary）6/6 通过。
+- **真实有摘要门槛（离线回放口径）已通过**：owner 取得脱敏真实上游样本并加入 `delivery-replay/samples/`——`gpt6sol-actual-high.sse`（99 非空摘要 delta、50 正文 delta）与 `gpt6astra-actual-high.sse`（92 / 56），两样本阶段密文均为 ENC0→ENC1→ENC2、终态 `completed`；经候选服务路径按逐事件 / 4 事件组 / 512 字节 3 种切块回放，2×3 全部通过（摘要与正文逐段送达且无重复、最终 `item.done` 恰好一次、终态密文与 `completed.output` 同值），仓库原 asis 与插入摘要夹具同时通过。**边界**：这是「脱敏真实 SSE + 宿主桩候选服务」的离线回放，不代表新库在 RK 生产请求中的表现，也不代表完整 CPA 模拟传输矩阵（宿主集成门槛）验证；现网部署验收仍以后续真实环境验证为准。
+
 ## v0.1.18.0 — 2026-10-02
 
 HTTP 流式推理摘要增量交付（取代 0.1.16.0 起的「推理摘要只在终态整批回放」；只影响 http 增量交付路径），并包含客户端历史冷重建与用户图片的全请求本地预检。

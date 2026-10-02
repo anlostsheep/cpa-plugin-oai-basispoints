@@ -683,37 +683,66 @@ func TestIncrementalSummarySuffixCompletedAtTerminal(t *testing.T) {
 	}
 }
 
-// item.done 与终态密文不一致 → invalid_upstream_stream；不一致的密文不得交付。
-func TestIncrementalSummaryCiphertextMismatchFails(t *testing.T) {
-	s := newBPStream("resp_up_cipher")
-	s.reasoning("密文校验。", 2)
-	changed := cloneObject(objectValue(s.output[0]))
-	changed["encrypted_content"] = "enc-terminal-different"
-	blocks := s.terminal(changed)
-	h := newIncHost(chunks(blocks, 5))
+// 生产事实（v0.1.18.0 事故）：added=ENC0、item.done=ENC1、completed.output=ENC2，同一 reasoning
+// 条目的阶段快照密文值两两不同——不能要求跨阶段字节相等。A2 契约：live 帧不携带密文，终态回放
+// 的最终 item.done 恰好一次、携带与 completed.output 同值的密文（ENC2）；摘要增量照常交付一次，正常完成。
+func TestIncrementalReasoningStageCiphertextsDeliveredOnceAtTerminal(t *testing.T) {
+	summary := "分阶段密文不应跨事件比对的摘要。"
+	const id = "rs_stage_cipher"
+	s := newBPStream("resp_up_stage_cipher")
+	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": id, "summary": []any{}, "encrypted_content": "ENC0"}})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "delta": summary})
+	s.add("response.reasoning_summary_text.done", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "text": summary})
+	s.add("response.reasoning_summary_part.done", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
+	s.add("response.output_item.done", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": id, "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "ENC1"}})
+	final := map[string]any{"type": "reasoning", "id": id, "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "ENC2"}
+	h := newIncHost(chunks(s.terminal(final), 4))
 	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
 	h.waitClosed(t)
 	if h.closeErr != nil {
-		t.Fatalf("request-scoped failure must close normally: %v", h.closeErr)
+		t.Fatalf("normal close expected, got %v", h.closeErr)
 	}
 	events := clientStreamEvents(t, []byte(h.snapshot()))
-	if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
-		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+		t.Fatalf("want completed once, got %v", eventTypes(events))
 	}
-	var code any
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("summary duplicated or missing: %q", got)
+	}
+	addedReasoning, doneReasoning := 0, 0
 	for _, e := range events {
-		if e["type"] == "response.failed" {
-			code = objectValue(objectValue(e["response"])["error"])["code"]
+		switch e["type"] {
+		case "response.output_item.added":
+			item := objectValue(e["item"])
+			if stringValue(item["type"]) != "reasoning" {
+				continue
+			}
+			addedReasoning++
+			if _, has := item["encrypted_content"]; has {
+				t.Fatalf("live reasoning added must not carry ciphertext: %v", e)
+			}
+		case "response.output_item.done":
+			item := objectValue(e["item"])
+			if stringValue(item["type"]) != "reasoning" {
+				continue
+			}
+			doneReasoning++
+			if item["encrypted_content"] != "ENC2" {
+				t.Fatalf("terminal replay must carry the final ciphertext exactly once: %v", e)
+			}
 		}
 	}
-	if code != "invalid_upstream_stream" {
-		t.Fatalf("failed code %v", code)
+	if addedReasoning != 1 || doneReasoning != 1 {
+		t.Fatalf("reasoning lifecycle must be one added + one done, got added=%d done=%d: %v", addedReasoning, doneReasoning, eventTypes(events))
 	}
-	if strings.Contains(h.snapshot(), "enc-terminal-different") {
-		t.Fatal("mismatched ciphertext leaked to client")
+	raw := h.snapshot()
+	if strings.Contains(raw, "ENC0") || strings.Contains(raw, "ENC1") {
+		t.Fatal("live stage ciphertexts leaked to client")
 	}
-	if got := streamedSummary(events); got != "密文校验。" {
-		t.Fatalf("summary delivered once before failure: %q", got)
+	finalOutput, _ := terminalEvent(t, events)["output"].([]any)
+	if len(finalOutput) != 1 || objectValue(finalOutput[0])["encrypted_content"] != "ENC2" {
+		t.Fatalf("completed.output must carry the final ciphertext: %s", jsonBytes(finalOutput))
 	}
 }
 
@@ -1396,8 +1425,9 @@ func TestStreamDeliveryEmptySummaryDoesNotCommitUntilText(t *testing.T) {
 	if err := dec.feed([]byte(s.blocks[firstDelta]), d.consume); err != nil {
 		t.Fatal(err)
 	}
-	if !d.committed || len(forwarded) != 8 {
-		t.Fatalf("message text must commit with 8 pending frames: committed=%v frames=%d", d.committed, len(forwarded))
+	if !d.committed || len(forwarded) != 7 {
+		// 8 个缓冲事件里 reasoning item.done 只校验不转发（密文延迟终态），批内交付 7 帧。
+		t.Fatalf("message text must commit with 7 pending frames: committed=%v frames=%d", d.committed, len(forwarded))
 	}
 	if got := streamedSummary(forwarded); got != "" {
 		t.Fatalf("empty summary delivered deltas: %q", got)
@@ -1421,6 +1451,9 @@ func TestReasoningSummaryEventsOnlyInDedicatedGenerator(t *testing.T) {
 			if summaryAny, _ := objectValue(e.value["item"])["summary"].([]any); len(summaryAny) != 1 {
 				t.Fatalf("legacy added must carry full summary: %v", e.value)
 			}
+			if objectValue(e.value["item"])["encrypted_content"] != "enc-gen" {
+				t.Fatalf("legacy added must stay unchanged (ciphertext kept): %v", e.value)
+			}
 		}
 	}
 	if want := "response.output_item.added,response.output_item.done,response.completed"; strings.Join(legacy, ",") != want {
@@ -1433,6 +1466,9 @@ func TestReasoningSummaryEventsOnlyInDedicatedGenerator(t *testing.T) {
 		case "response.output_item.added":
 			if summaryAny, _ := objectValue(e.value["item"])["summary"].([]any); len(summaryAny) != 0 {
 				t.Fatalf("dedicated added must start with empty summary: %v", e.value)
+			}
+			if _, has := objectValue(e.value["item"])["encrypted_content"]; has {
+				t.Fatalf("dedicated added must not carry ciphertext: %v", e.value)
 			}
 		case "response.output_item.done":
 			if objectValue(e.value["item"])["encrypted_content"] != "enc-gen" {
@@ -1613,91 +1649,137 @@ func TestStreamSessionAbortOwnsCloseReason(t *testing.T) {
 	}
 }
 
-// ---- A6 一致性：added 已交付密文冲突拒绝、开场预填字段规范化 ----
+// ---- A6 一致性：密文随终态交付（最终 item.done 与 completed.output 同值）、开场预填字段规范化 ----
 
-// added 已交付非空密文 A，done 与终态改为 B：已交付已知内容冲突 → response.failed，
-// B 不外发、不重生成、不 completed。
-func TestIncrementalAddedCiphertextConflictFailsAtDone(t *testing.T) {
-	summary := "已交付的摘要。"
-	s := newBPStream("resp_up_added_cipher")
-	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_added_cipher", "summary": []any{}, "encrypted_content": "enc-added-A"}})
-	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
-	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "delta": summary})
-	s.add("response.reasoning_summary_text.done", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "text": summary})
-	s.add("response.reasoning_summary_part.done", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
-	changed := map[string]any{"type": "reasoning", "id": "rs_added_cipher", "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "enc-done-B"}
-	s.add("response.output_item.done", map[string]any{"output_index": 0, "item": changed})
-	blocks := s.terminal(changed)
-	cut := indexOfType(blocks, "response.reasoning_summary_text.delta", 1) + 1
-	h := newIncHost(chunks(blocks, cut))
+// 生产 as-is 形态（无摘要增量）：reasoning 在首个 message 增量前完成（added/done/终态的阶段
+// 密文值可不同）。live reasoning item.done 只校验不转发，不阻断缓冲批提交——message 增量照常
+// 流式交付（v0.1.18.0 曾因密文比对失败静默丢失），终态回放给出带 ENC2 的完整条目（与 completed.output 同值）。
+func TestIncrementalReasoningDoneConsumedThenMessageDeltasCommit(t *testing.T) {
+	text := "The smallest positive integer is 423."
+	const id = "rs_no_summary"
+	s := newBPStream("resp_up_no_summary")
+	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": id, "content": []any{}, "summary": []any{}, "encrypted_content": "ENC0"}})
+	s.add("response.output_item.done", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": id, "content": []any{}, "summary": []any{}, "encrypted_content": "ENC1"}})
+	s.add("response.output_item.added", map[string]any{"output_index": 1, "item": map[string]any{"type": "message", "id": "msg_no_summary", "status": "in_progress", "content": []any{}, "role": "assistant"}})
+	s.add("response.content_part.added", map[string]any{"output_index": 1, "content_index": 0, "item_id": "msg_no_summary", "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
+	for _, d := range splitText(text, 4) {
+		s.add("response.output_text.delta", map[string]any{"output_index": 1, "content_index": 0, "item_id": "msg_no_summary", "delta": d})
+	}
+	msgPart := map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
+	s.add("response.output_text.done", map[string]any{"output_index": 1, "content_index": 0, "item_id": "msg_no_summary", "text": text})
+	s.add("response.content_part.done", map[string]any{"output_index": 1, "content_index": 0, "item_id": "msg_no_summary", "part": msgPart})
+	s.add("response.output_item.done", map[string]any{"output_index": 1, "item": map[string]any{"type": "message", "id": "msg_no_summary", "status": "completed", "content": []any{msgPart}, "role": "assistant"}})
+	finalReasoning := map[string]any{"type": "reasoning", "id": id, "content": []any{}, "summary": []any{}, "encrypted_content": "ENC2"}
+	finalMessage := map[string]any{"type": "message", "id": "msg_no_summary", "status": "completed", "content": []any{msgPart}, "role": "assistant"}
+	h := newIncHost(chunks(s.terminal(finalReasoning, finalMessage), 4))
 	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
 	h.waitClosed(t)
-	if h.nextID != 1 {
-		t.Fatalf("must not regenerate, attempts=%d", h.nextID)
-	}
 	if h.closeErr != nil {
-		t.Fatalf("request-scoped failure must close normally: %v", h.closeErr)
+		t.Fatalf("normal close expected, got %v", h.closeErr)
 	}
 	events := clientStreamEvents(t, []byte(h.snapshot()))
-	if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
-		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+		for _, e := range events {
+			if e["type"] == "response.failed" {
+				t.Fatalf("unexpected failure: %s", jsonBytes(e))
+			}
+		}
+		t.Fatalf("want completed once, got %v", eventTypes(events))
 	}
-	var code any
+	if got := streamedText(events); got != text {
+		t.Fatalf("message deltas must be delivered live exactly once: %q", got)
+	}
+	if countType(events, "response.reasoning_summary_text.delta") != 0 {
+		t.Fatalf("no summary increments in this shape: %v", eventTypes(events))
+	}
+	doneReasoning := 0
 	for _, e := range events {
-		if e["type"] == "response.failed" {
-			code = objectValue(objectValue(e["response"])["error"])["code"]
+		if e["type"] == "response.output_item.done" && stringValue(objectValue(e["item"])["type"]) == "reasoning" {
+			doneReasoning++
+			if objectValue(e["item"])["encrypted_content"] != "ENC2" {
+				t.Fatalf("reasoning done must carry the final ciphertext: %v", e)
+			}
 		}
 	}
-	if code != "invalid_upstream_stream" {
-		t.Fatalf("failed code %v", code)
+	if doneReasoning != 1 {
+		t.Fatalf("reasoning done count=%d want 1: %v", doneReasoning, eventTypes(events))
 	}
 	raw := h.snapshot()
-	if !strings.Contains(raw, "enc-added-A") {
-		t.Fatal("delivered ciphertext A missing before the conflict")
-	}
-	if strings.Contains(raw, "enc-done-B") {
-		t.Fatal("conflicting ciphertext leaked to client")
-	}
-	if got := streamedSummary(events); got != summary {
-		t.Fatalf("summary must be delivered exactly once before failure: %q", got)
-	}
-	if n := countType(events, "response.reasoning_summary_text.done"); n != 1 {
-		t.Fatalf("lifecycle before the conflict must complete once, got %d", n)
+	if strings.Contains(raw, "ENC0") || strings.Contains(raw, "ENC1") {
+		t.Fatal("live stage ciphertexts leaked to client")
 	}
 }
 
-// added 已交付非空密文 A，没有 item.done，终态直接改为 B：同一冲突在终态核对时失败。
-func TestIncrementalAddedCiphertextConflictFailsAtFinal(t *testing.T) {
-	summary := "已交付的摘要。"
-	s := newBPStream("resp_up_added_cipher_final")
-	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_added_cipher_final", "summary": []any{}, "encrypted_content": "enc-added-A"}})
-	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_added_cipher_final", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
-	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_added_cipher_final", "summary_index": 0, "delta": summary})
-	changed := map[string]any{"type": "reasoning", "id": "rs_added_cipher_final", "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "enc-final-B"}
-	blocks := s.terminal(changed)
-	cut := indexOfType(blocks, "response.reasoning_summary_text.delta", 1) + 1
-	h := newIncHost(chunks(blocks, cut))
-	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
-	h.waitClosed(t)
-	if h.nextID != 1 {
-		t.Fatalf("must not regenerate, attempts=%d", h.nextID)
+// 终态条目缺失/空字符串密文时照原样交付：绝不从 added/done 的瞬时值合成或改写密文。
+func TestIncrementalReasoningFinalCipherMissingStaysAsIs(t *testing.T) {
+	variants := []struct {
+		name string
+		set  func(item map[string]any)
+		want func(item map[string]any) bool
+	}{
+		{"missing", func(map[string]any) {}, func(item map[string]any) bool {
+			_, has := item["encrypted_content"]
+			return !has
+		}},
+		{"empty", func(item map[string]any) { item["encrypted_content"] = "" }, func(item map[string]any) bool {
+			value, has := item["encrypted_content"]
+			return has && value == ""
+		}},
 	}
-	if h.closeErr != nil {
-		t.Fatalf("request-scoped failure must close normally: %v", h.closeErr)
-	}
-	events := clientStreamEvents(t, []byte(h.snapshot()))
-	if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
-		t.Fatalf("want response.failed only, got %v", eventTypes(events))
-	}
-	if strings.Contains(h.snapshot(), "enc-final-B") {
-		t.Fatal("conflicting ciphertext leaked to client")
-	}
-	if got := streamedSummary(events); got != summary {
-		t.Fatalf("summary must be delivered exactly once before failure: %q", got)
+	for _, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			summary := "终态缺密文时照原样交付的摘要。"
+			id := "rs_final_cipher_" + variant.name
+			s := newBPStream("resp_up_final_cipher_" + variant.name)
+			s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": id, "summary": []any{}, "encrypted_content": "ENC0"}})
+			s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+			s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "delta": summary})
+			s.add("response.reasoning_summary_text.done", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "text": summary})
+			s.add("response.reasoning_summary_part.done", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
+			final := map[string]any{"type": "reasoning", "id": id, "summary": []any{map[string]any{"type": "summary_text", "text": summary}}}
+			variant.set(final)
+			s.add("response.output_item.done", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": id, "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "ENC1"}})
+			blocks := s.terminal(final)
+			cut := indexOfType(blocks, "response.reasoning_summary_text.delta", 1) + 1
+			h := newIncHost(chunks(blocks, cut))
+			startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+			h.waitClosed(t)
+			if h.closeErr != nil {
+				t.Fatalf("normal close expected, got %v", h.closeErr)
+			}
+			events := clientStreamEvents(t, []byte(h.snapshot()))
+			if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+				t.Fatalf("want completed once, got %v", eventTypes(events))
+			}
+			if got := streamedSummary(events); got != summary {
+				t.Fatalf("summary duplicated or missing: %q", got)
+			}
+			doneSeen := false
+			for _, e := range events {
+				if e["type"] != "response.output_item.done" || stringValue(objectValue(e["item"])["type"]) != "reasoning" {
+					continue
+				}
+				doneSeen = true
+				if !variant.want(objectValue(e["item"])) {
+					t.Fatalf("terminal done must carry the final item as-is: %v", e)
+				}
+			}
+			if !doneSeen {
+				t.Fatalf("missing terminal reasoning done: %v", eventTypes(events))
+			}
+			finalOutput, _ := terminalEvent(t, events)["output"].([]any)
+			if len(finalOutput) != 1 || !variant.want(objectValue(finalOutput[0])) {
+				t.Fatalf("completed.output must be unchanged: %s", jsonBytes(finalOutput))
+			}
+			if raw := h.snapshot(); strings.Contains(raw, "ENC0") || strings.Contains(raw, "ENC1") {
+				t.Fatal("stage ciphertexts must not be synthesized into any frame")
+			}
+		})
 	}
 }
 
-// added 密文缺失/null/空（都视为无已知值）时，done/终态可以合法补全非空密文，正常完成一次。
+// live added 帧无论是否携带密文（含缺失/null/空变体）都统一剥离；密文由终态条目的最终
+// item.done 交付（恰好一次，与 completed.output 同值），三种变体都正常完成一次。
 func TestIncrementalAddedEmptyCiphertextCompletedAtDoneOrFinal(t *testing.T) {
 	variants := []struct {
 		name string
@@ -1762,7 +1844,7 @@ func TestIncrementalAddedEmptyCiphertextCompletedAtDoneOrFinal(t *testing.T) {
 	}
 }
 
-// HTTP 已提交增量：added/part.added 的预填摘要文本被规范化为空开场（身份/密文保留），
+// HTTP 已提交增量：added/part.added 的预填摘要文本被规范化为空开场（身份保留、密文剥离），
 // 正文只经 delta 累计一次，生命周期恰好一次。
 func TestIncrementalReasoningPrefilledOpeningFieldsNormalized(t *testing.T) {
 	summary := "第一段第二段"
@@ -1799,8 +1881,11 @@ func TestIncrementalReasoningPrefilledOpeningFieldsNormalized(t *testing.T) {
 			if summaryAny, _ := opened["summary"].([]any); len(summaryAny) != 0 {
 				t.Fatalf("reasoning added must start with empty summary: %v", e)
 			}
-			if opened["id"] != "rs_prefill" || opened["encrypted_content"] != "enc-prefill" {
-				t.Fatalf("identity/ciphertext must be preserved in opening: %v", e)
+			if opened["id"] != "rs_prefill" {
+				t.Fatalf("identity must be preserved in opening: %v", e)
+			}
+			if _, has := opened["encrypted_content"]; has {
+				t.Fatalf("live opening must not carry ciphertext: %v", e)
 			}
 		case "response.reasoning_summary_part.added":
 			partSeen = true

@@ -33,17 +33,19 @@ type streamedMessage struct {
 	done  bool
 }
 
-// streamedReasoning 独立记录推理条目的交付进度：summary part 与密文不登记为普通消息，
-// 终态核对时用于校验身份、文本前缀、done 内容与密文（含 added 已交付值）一致。
+// streamedReasoning 独立记录推理条目的交付进度，不登记为普通消息。只核对身份与摘要文本
+// （前缀/精确）；密文不跨事件比对——脱敏捕获只证明同一 reasoning 条目的阶段快照
+// （added/done/completed）密文值可不同，不能要求跨阶段字节相等（v0.1.18.0 生产事故根因）。
+// 密文随终态交付：live added 帧剥离密文，live item.done 只校验不转发；终态回放的最终
+// item.done 恰好一次，其密文与 completed/incomplete.output 同值。
 type streamedReasoning struct {
-	id            string
-	summaries     map[int]*streamedPart
-	done          bool
-	doneSummary   []any
-	doneEncrypted any
-	// addedEncrypted 是 output_item.added 已交付客户端的非空密文；缺失/null/空视为无已知值，
-	// 终态可以合法补全，已知值被替换或丢失即为冲突。
-	addedEncrypted any
+	id        string
+	summaries map[int]*streamedPart
+	// upstreamDone 记录上游已发来合法的 output_item.done（只校验并做 doneSummary 快照，
+	// 不转发；重复的 done 被拒绝）。终态回放的最终 item.done 恒保留：恰好一次，
+	// 携带与 completed/incomplete.output 同值的密文。
+	upstreamDone bool
+	doneSummary  []any
 }
 
 type streamDelivery struct {
@@ -209,6 +211,10 @@ func (d *streamDelivery) consume(event, data string) error {
 		if err != nil {
 			return err
 		}
+		// nil 表示事件已消费但不转发（推理 item.done 只校验，密文延迟到终态回放交付）。
+		if frame == nil {
+			return nil
+		}
 		d.noteDelivered([]map[string]any{frame})
 		return d.forward(nil, []map[string]any{frame})
 	}
@@ -260,7 +266,11 @@ func (d *streamDelivery) replayPending() ([]map[string]any, bool) {
 		if err != nil {
 			return nil, false
 		}
-		frames = append(frames, frame)
+		// 已消费但不转发的事件（推理 item.done）不进入交付批次；本批的提交触发者必为
+		// 非空 delta，frames 至少含该帧。
+		if frame != nil {
+			frames = append(frames, frame)
+		}
 	}
 	d.messages, d.reasonings = probe.messages, probe.reasonings
 	d.pending = nil
@@ -294,8 +304,9 @@ func (d *streamDelivery) applyEvent(value map[string]any) (map[string]any, error
 	return d.applyMessageEvent(value)
 }
 
-// applyReasoningEvent 校验并登记推理条目事件；开场（added）统一清空预填摘要字段，正文只经
-// delta 累计（与专用终态生成器及 message 路径一致），其余字段（身份、密文等）保持原样。
+// applyReasoningEvent 校验并登记推理条目事件；开场（added）统一清空预填摘要字段并剥离密文
+// （正文只经 delta 累计，密文随终态回放交付、与终态 output 同值），其余字段（身份等）保持原样。
+// item.done 由 validateItem 校验并登记 upstreamDone 快照后返回 nil 帧（不转发）。
 // 使用独立状态记录交付进度，不登记为普通消息（与消息同 index 冲突即报错）。
 func (d *streamDelivery) applyReasoningEvent(value map[string]any) (map[string]any, error) {
 	index, err := streamIndex(value["output_index"])
@@ -310,14 +321,16 @@ func (d *streamDelivery) applyReasoningEvent(value map[string]any) (map[string]a
 		if r != nil || d.messages[index] != nil || id == "" {
 			return nil, streamEventError()
 		}
-		d.reasonings[index] = &streamedReasoning{id: id, summaries: map[int]*streamedPart{}, addedEncrypted: knownEncryptedContent(item)}
+		d.reasonings[index] = &streamedReasoning{id: id, summaries: map[int]*streamedPart{}}
 		frame := cloneObject(value)
 		added := cloneObject(objectValue(frame["item"]))
 		added["summary"] = []any{}
+		// 上游 added 携带的是阶段快照瞬时密文（与 done/终态的值可不同）：live 帧不携带密文。
+		delete(added, "encrypted_content")
 		frame["item"] = added
 		return frame, nil
 	}
-	if r == nil || r.done {
+	if r == nil || r.upstreamDone {
 		return nil, streamEventError()
 	}
 	if kind == "response.output_item.done" {
@@ -329,10 +342,9 @@ func (d *streamDelivery) applyReasoningEvent(value map[string]any) (map[string]a
 				return nil, streamEventError()
 			}
 		}
-		r.done = true
+		r.upstreamDone = true
 		r.doneSummary, _ = objectValue(value["item"])["summary"].([]any)
-		r.doneEncrypted = objectValue(value["item"])["encrypted_content"]
-		return value, nil
+		return nil, nil
 	}
 	if value["item_id"] != r.id {
 		return nil, streamEventError()
@@ -379,17 +391,15 @@ func (d *streamDelivery) applyReasoningEvent(value map[string]any) (map[string]a
 	return value, nil
 }
 
-// validateItem 核对终态条目与已登记的推理状态：身份、文本前缀、done 内容与密文（含 added
-// 已交付的非空值）一致。
+// validateItem 核对条目与已登记的推理状态：身份一致；上游 done 快照（若有）的摘要与当前
+// 条目完全一致；每个已开启 part 的文本是条目最终文本的前缀（textDone 时精确相等）。
+// 密文不参与任何跨事件比对：阶段快照（added/done/completed）密文值可不同，缺失时也可能不再给出。
 func (r *streamedReasoning) validateItem(item map[string]any) error {
 	if stringValue(item["type"]) != "reasoning" || stringValue(item["id"]) != r.id {
 		return streamEventError()
 	}
-	if r.addedEncrypted != nil && !bytes.Equal(jsonBytes(item["encrypted_content"]), jsonBytes(r.addedEncrypted)) {
-		return streamEventError()
-	}
 	summaries, _ := item["summary"].([]any)
-	if r.done && (!bytes.Equal(jsonBytes(summaries), jsonBytes(r.doneSummary)) || !bytes.Equal(jsonBytes(item["encrypted_content"]), jsonBytes(r.doneEncrypted))) {
+	if r.upstreamDone && !bytes.Equal(jsonBytes(summaries), jsonBytes(r.doneSummary)) {
 		return streamEventError()
 	}
 	for i, part := range r.summaries {
@@ -403,19 +413,6 @@ func (r *streamedReasoning) validateItem(item map[string]any) error {
 		}
 	}
 	return nil
-}
-
-// knownEncryptedContent 读取 added 事件已交付的非空密文：缺失、null 与空字符串视为无已知值
-// （终态可以合法补全）；其余值必须与 done/终态完全一致。
-func knownEncryptedContent(item map[string]any) any {
-	value, exists := item["encrypted_content"]
-	if !exists || value == nil {
-		return nil
-	}
-	if text, ok := value.(string); ok && text == "" {
-		return nil
-	}
-	return value
 }
 
 func (d *streamDelivery) applyMessageEvent(value map[string]any) (map[string]any, error) {
@@ -601,7 +598,9 @@ func (d *streamDelivery) keepFinal(ev *sseEvent) bool {
 		return true
 	}
 	if reasoning := d.reasonings[index]; reasoning != nil {
-		if kind == "response.output_item.added" || (kind == "response.output_item.done" && reasoning.done) {
+		// added 已 live 交付（剥离密文）；item.done 从未 live 交付（只校验），终态回放的
+		// done 必须保留——最终 item.done 恰好一次，其密文与 completed/incomplete.output 同值。
+		if kind == "response.output_item.added" {
 			return false
 		}
 		if partIndex, ok := eventIndex(ev.value["summary_index"]); ok {
