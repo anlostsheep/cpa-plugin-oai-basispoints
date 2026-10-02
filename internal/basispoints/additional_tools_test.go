@@ -54,7 +54,7 @@ func TestCodexAdditionalToolsCatalogCallAndReplay(t *testing.T) {
 		t.Fatalf("Codex client tool identity changed: %#v", call)
 	}
 	result := map[string]any{"type": "custom_tool_call_output", "call_id": call["call_id"], "output": "directory listing"}
-	replay := translateInputItems([]any{call, result}, clientToolSpecs(source))
+	replay := translateInputItems([]any{call, result})
 	if !reflect.DeepEqual(replay[0], native) || objectValue(replay[1])["type"] != "function_call_output" || objectValue(replay[1])["output"] != result["output"] {
 		t.Fatalf("native call or output replay changed: %#v", replay)
 	}

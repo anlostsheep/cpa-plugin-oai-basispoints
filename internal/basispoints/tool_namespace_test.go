@@ -41,7 +41,7 @@ func TestNamespacedToolCallPreservesNamespace(t *testing.T) {
 	if _, _, _, err := transformResponseBody(jsonBytes(map[string]any{"output": []any{native}}), source); err != nil {
 		t.Fatal(err)
 	}
-	if replay := translateInputItems([]any{call}, clientToolSpecs(source)); !reflect.DeepEqual(replay[0], native) {
+	if replay := translateInputItems([]any{call}); !reflect.DeepEqual(replay[0], native) {
 		t.Fatalf("cached replay = %#v, want %#v", replay[0], native)
 	}
 }
@@ -95,7 +95,12 @@ func TestClientToolIdentityAndReplay(t *testing.T) {
 				t.Fatalf("transform: changed=%t err=%v", changed, err)
 			}
 			call := objectValue(response["output"].([]any)[0])
-			if call["type"] != itemType || call["name"] != tc.name || stringValue(call["namespace"]) != tc.namespace || call["call_id"] != native["call_id"] || call["id"] != native["id"] {
+			wantID := native["id"]
+			if tc.kind == "custom" {
+				// custom 调用的 item id 用 ctc_ 前缀（上游 PR #14）。
+				wantID = "ctc_" + strings.TrimPrefix(stringValue(native["id"]), "fc_")
+			}
+			if call["type"] != itemType || call["name"] != tc.name || stringValue(call["namespace"]) != tc.namespace || call["call_id"] != native["call_id"] || call["id"] != wantID {
 				t.Fatalf("client identity changed: %#v", call)
 			}
 			if tc.namespace == "" {
@@ -122,7 +127,7 @@ func TestClientToolIdentityAndReplay(t *testing.T) {
 						historyCall["call_id"] = stringValue(call["call_id"]) + "_cache_miss"
 					}
 					result := map[string]any{"type": outputType, "call_id": historyCall["call_id"], "name": tc.name, "namespace": tc.namespace, "output": output}
-					replay := translateInputItems([]any{historyCall, result}, clientToolSpecs(source))
+					replay := translateInputItems([]any{historyCall, result})
 					if len(replay) != 2 {
 						t.Fatalf("replay length = %d", len(replay))
 					}
@@ -130,9 +135,17 @@ func TestClientToolIdentityAndReplay(t *testing.T) {
 					if cached && !reflect.DeepEqual(replayedCall, native) {
 						t.Fatalf("native replay changed: %#v", replayedCall)
 					}
-					envelope, _ := transportEnvelope(replayedCall)
-					if envelope["tool"] != key || !reflect.DeepEqual(envelope["args"], args) {
-						t.Fatalf("replay envelope = %#v", envelope)
+					// 命中缓存时原样回放旧封装；未命中时按新格式重建（references + 纯载荷）。
+					relay, err := transportEnvelope(replayedCall)
+					if err != nil || relay.tool != key || relay.legacy != cached {
+						t.Fatalf("replay envelope = %#v err=%v", relay, err)
+					}
+					if tc.kind == "custom" {
+						if relay.payload != args {
+							t.Fatalf("custom replay payload changed: %#v", relay.payload)
+						}
+					} else if parsed, reason := decodeFunctionArguments(relay.payload); reason != "" || !reflect.DeepEqual(parsed, args) {
+						t.Fatalf("function replay payload = %#v (%s)", parsed, reason)
 					}
 					if replayedOutput["type"] != "function_call_output" || replayedOutput["call_id"] != replayedCall["call_id"] || !reflect.DeepEqual(replayedOutput["output"], output) {
 						t.Fatalf("tool result changed: %#v", replayedOutput)
@@ -181,9 +194,13 @@ func TestClientToolArgumentsPreserveLargeIntegers(t *testing.T) {
 		t.Fatalf("integer precision lost: %s", call["arguments"])
 	}
 	call["call_id"] = "call_uncached_" + t.Name()
-	replay := translateInputItems([]any{call}, clientToolSpecs(source))
-	if envelope, _ := transportEnvelope(objectValue(replay[0])); !reflect.DeepEqual(envelope["args"], args) {
-		t.Fatalf("replay lost integer precision: %#v", envelope)
+	replay := translateInputItems([]any{call})
+	relay, err := transportEnvelope(objectValue(replay[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed, _ := decodeFunctionArguments(relay.payload); !reflect.DeepEqual(parsed, args) {
+		t.Fatalf("replay lost integer precision: %#v", relay)
 	}
 }
 
@@ -319,7 +336,7 @@ func TestClientToolChoiceConstrainsCallsButNotHistory(t *testing.T) {
 				t.Fatal(err)
 			}
 			input := prepared["input"].([]any)
-			if envelope, _ := transportEnvelope(objectValue(input[len(input)-1])); envelope["tool"] != "alpha.js" {
+			if envelope, _ := transportEnvelope(objectValue(input[len(input)-1])); envelope.tool != "alpha.js" {
 				t.Fatalf("tool choice altered history: %#v", input[len(input)-1])
 			}
 		})

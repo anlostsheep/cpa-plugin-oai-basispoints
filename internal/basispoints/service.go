@@ -287,15 +287,25 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 	if err := json.Unmarshal(raw, &request); err != nil {
 		return nil, fail(400, "invalid_request", "executor request is invalid")
 	}
+	transport := s.config().Transport
+	if !stream {
+		transport = TransportHTTP
+	}
+	summary := s.newRelaySummary(request, transport, stream)
+	// 在准备凭据与建连之前判断工具可调用性，同步失败的请求也计入正确的分母。
+	summary.setToolCallableFrom(request)
+	request.summary = summary
 	// 在任何宿主 HTTP 调用（含 prepareRequest 里的附件上传）之前登记生命周期，
 	// 使 plugin.shutdown 能等待并取消它们。
 	done, err := s.ensureLife(&request)
 	if err != nil {
+		summary.finish("", err)
 		return nil, err
 	}
 	body, credential, err := s.prepareRequest(request)
 	if err != nil {
 		done()
+		summary.finish("prepare_error", err)
 		return nil, err
 	}
 	if stream {
@@ -303,14 +313,23 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 		return s.executeStream(request, body, credential)
 	}
 	defer done()
+	result, err := s.executeOnce(request, body, credential)
+	summary.finish("", err)
+	return result, err
+}
+
+// executeOnce 是非流式执行：交付前完成全量校验；中转格式错误只在插件内重新生成一次。
+func (s *Service) executeOnce(request ExecutorRequest, body map[string]any, credential credential) (any, error) {
+	summary := request.relaySummary(s, TransportHTTP, false)
 	source, err := requestSource(request)
 	if err != nil {
 		return nil, err
 	}
-	// 在交付任何客户端数据前完成全量校验；中转格式错误只在插件内重新生成一次。
+	summary.setToolCallable(len(callableClientToolSpecs(source)) > 0)
 	// 两次往返共享同一截止时间（附件上传在此之前，另行计时）。
 	request.deadline = time.Now().Add(time.Duration(s.config().TimeoutSeconds) * time.Second)
 	for attempt := 0; ; attempt++ {
+		summary.attemptStarted()
 		upstream, err := s.upstreamRequest(request, body, credential, false)
 		if err != nil {
 			return nil, err
@@ -322,8 +341,10 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		payload, _, _, err := transformResponseBody(jsonBytes(response), source)
+		payload, _, _, stats, err := transformResponseBodyStats(jsonBytes(response), source)
+		summary.validated(stats, err)
 		if err == nil {
+			summary.setTerminalStatus(stringValue(response["status"]))
 			return map[string]any{"Payload": payload, "Headers": reencodedHeaders(upstream.Headers)}, nil
 		}
 		retry, ok := relayRetryBody(body, response, err, attempt)
@@ -331,8 +352,17 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 			return nil, err
 		}
 		s.logRegenerate(request, "http", false, err)
+		summary.regenerating()
 		body = retry
 	}
+}
+
+// relaySummary 返回本次执行的汇总；测试直接调用执行分支时按需创建。
+func (r *ExecutorRequest) relaySummary(s *Service, transport string, stream bool) *relaySummary {
+	if r.summary == nil {
+		r.summary = s.newRelaySummary(*r, transport, stream)
+	}
+	return r.summary
 }
 
 // requestSource 取客户端原始请求（优先 OriginalRequest），用于工具目录校验与回放。
@@ -420,13 +450,18 @@ type httpConnectResult struct {
 }
 
 func (s *Service) executeStream(request ExecutorRequest, body map[string]any, credential credential) (any, error) {
+	summary := request.relaySummary(s, s.config().Transport, true)
+	summary.setToolCallableFrom(request)
 	done, err := s.ensureLife(&request)
 	if err != nil {
+		summary.finish("", err)
 		return nil, err
 	}
 	if request.StreamID == "" {
 		done()
-		return nil, fail(500, "stream_id_missing", "executor.execute_stream requires stream_id")
+		err := fail(500, "stream_id_missing", "executor.execute_stream requires stream_id")
+		summary.finish("prepare_error", err)
+		return nil, err
 	}
 	if s.config().Transport == TransportWS {
 		return s.executeStreamWS(request, body, credential)
@@ -441,6 +476,7 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 	request.deadline = time.Now().Add(time.Duration(cfg.TimeoutSeconds) * time.Second)
 	guard := s.newUpstreamGuard(request.HostCallbackID, credential.AccessToken, stop, runCtx.Done(), time.Duration(cfg.TimeoutSeconds)*time.Second, timeoutError(cfg))
 	connected := make(chan httpConnectResult, 1)
+	summary.attemptStarted()
 	go func() {
 		upstream, err := s.upstreamStream(request, body, credential, guard)
 		connected <- httpConnectResult{upstream: upstream, err: err}
@@ -449,15 +485,25 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 	if early != nil && early.err != nil {
 		guard.release()
 		done()
+		summary.finish("connect_error", early.err)
 		return nil, early.err
 	}
 	session := s.newStreamSession(request.StreamID, cfg.heartbeatInterval(), func() {
 		stopOnce.Do(func() { close(stop) })
 	})
+	// 先挂汇总钩子，再启动会触发关流的看门狗（bindLifecycle / bindDeadline）。
+	summary.bind(session)
 	session.bindLifecycle(runCtx)
 	session.bindDeadline(request.deadline, timeoutError(cfg))
 	go func() {
 		defer done()
+		// failWith 以错误收尾；汇总由关流钩子在 host.stream.close 之前写出（带 request_id），
+		// 这里的 finish 只在钩子未触发时兜底。exit 为空时按错误推断。
+		failWith := func(exit string, err error) {
+			summary.setExit(exit)
+			session.fail(err)
+			summary.finishAfter(session, exit, err)
+		}
 		if early != nil {
 			// 已在同步窗口内建连：等上游 response.created 以上游 id 开流（首次空闲心跳先到则用合成 id）。
 			session.startIdle()
@@ -471,7 +517,7 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 			late := <-connected
 			if late.err != nil {
 				guard.release()
-				session.fail(late.err)
+				failWith("connect_error", late.err)
 				return
 			}
 			upstream = late.upstream
@@ -479,12 +525,24 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 		source, parseErr := requestSource(request)
 		if parseErr != nil {
 			guard.release()
-			session.fail(parseErr)
+			failWith("prepare_error", parseErr)
 			return
+		}
+		callable := len(callableClientToolSpecs(source)) > 0
+		summary.setToolCallable(callable)
+		// buffered：本轮有可调用工具时整轮校验通过后再交付，交付前仍可重新生成一次。
+		buffered := cfg.StreamToolMode == StreamToolModeBuffered && callable
+		if buffered {
+			summary.setDelivery("buffered")
 		}
 		for attempt := 0; ; attempt++ {
 			// 每次往返一台新的增量交付状态机；客户端 response id 由会话固定，不随重新生成改变。
-			delivery := newStreamDelivery(session.open, session.deliver)
+			// 正文 commit 的那一刻就记下 text_committed（看门狗可能在读取结束前强制关流）。
+			delivery := newStreamDelivery(session.open, func(meta map[string]any, frames []map[string]any) error {
+				summary.markTextCommitted()
+				return session.deliver(meta, frames)
+			})
+			delivery.bufferUntilValidated = buffered
 			feeder := newIncrementalFeeder(delivery)
 			raw, readErr := s.readGuardedInto(upstream, guard, feeder.feed)
 			// release 等待看守协程退出并关闭上游流；此后本往返不再有守卫发起的宿主回调。
@@ -493,34 +551,46 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				// EOF：处理最后一个没有空行结尾的事件，让它同样经过状态机校验。
 				readErr = feeder.flush()
 			}
+			if delivery.committed {
+				summary.markTextCommitted()
+			}
 			if readErr != nil {
-				session.fail(readErr)
+				failWith("", readErr)
 				return
 			}
 			response, parseErr := parseResponse(raw, upstream.Headers)
 			if parseErr != nil {
-				session.fail(parseErr)
+				failWith("", parseErr)
 				return
 			}
-			// 先核对终态与已交付正文一致，再做工具整批转换（转换会写入历史身份缓存）。
+			// 先核对终态与已交付（或缓冲校验）的正文一致，再做工具整批转换（转换会写入历史身份缓存）。
 			if err := delivery.validateFinal(response); err != nil {
-				session.fail(err)
+				failWith("", err)
 				return
 			}
-			if !delivery.committed && delivery.events > 0 && hasMessageText(response) {
+			if !delivery.committed && !delivery.bufferUntilValidated && delivery.events > 0 && hasMessageText(response) {
 				// 有 SSE 事件和正文却没有增量交付（上游未按 created/item/part 顺序给出）：退回终态回放。
 				s.logEvent(request, "info", "basispoints: message text replayed at terminal without incremental delivery", map[string]any{
 					"transport": "http", "upstream_events": delivery.events,
 				})
 			}
-			_, transformedResponse, _, transformErr := transformResponseBody(jsonBytes(response), source)
+			_, transformedResponse, _, stats, transformErr := transformResponseBodyStats(jsonBytes(response), source)
+			summary.validated(stats, transformErr)
 			if transformErr == nil {
+				summary.setTerminalStatus(stringValue(transformedResponse["status"]))
 				// finish 在持锁的最终输出边界再次检查本代是否已停止；已 commit 时只补发未交付部分。
+				// keepFinal 只用于增量交付且正文已 commit 的情形；buffered 一律完整回放。
+				var outcome string
 				if delivery.committed {
-					session.finishWith(transformedResponse, delivery.keepFinal)
+					outcome = session.finishWith(transformedResponse, delivery.keepFinal)
 				} else {
-					session.finish(transformedResponse)
+					outcome = session.finish(transformedResponse)
 				}
+				var outcomeErr error
+				if outcome == finishStopped {
+					outcomeErr = stoppedError()
+				}
+				summary.finishAfter(session, outcome, outcomeErr)
 				return
 			}
 			if delivery.committed {
@@ -528,29 +598,31 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				s.logEvent(request, "warn", "basispoints: tool call invalid after text was delivered; not regenerating", map[string]any{
 					"transport": "http", "kind": errorKind(transformErr),
 				})
-				session.fail(transformErr)
+				failWith("", transformErr)
 				return
 			}
 			retry, ok := relayRetryBody(body, response, transformErr, attempt)
 			if !ok {
-				session.fail(transformErr)
+				failWith("", transformErr)
 				return
 			}
 			s.logRegenerate(request, "http", true, transformErr)
+			summary.regenerating()
 			// 重新生成一次：新的往返使用新的守卫，同样受客户端断开、插件停止约束，超时只剩
 			// 首次往返用剩的时长；心跳在此期间继续保活。此时下游流已开启，本次往返的失败
 			// （含 401/403/429）只能以无状态码的流错误关闭，与延迟心跳的既有折中一致。
 			body = retry
 			remaining, ok := request.roundTripTimeout(cfg)
 			if !ok {
-				session.fail(timeoutError(cfg))
+				failWith("", timeoutError(cfg))
 				return
 			}
 			guard = s.newUpstreamGuard(request.HostCallbackID, credential.AccessToken, stop, runCtx.Done(), remaining, timeoutError(cfg))
+			summary.attemptStarted()
 			next, err := s.upstreamStream(request, body, credential, guard)
 			if err != nil {
 				guard.release()
-				session.fail(err)
+				failWith("", err)
 				return
 			}
 			upstream = next
@@ -646,6 +718,7 @@ func (s *Service) status() map[string]any {
 		"models":            cfg.Models,
 		"model_mappings":    cfg.ModelMappings,
 		"transport":         cfg.Transport,
+		"stream_tool_mode":  cfg.StreamToolMode,
 		"stopped":           stopped,
 		"reasoning_efforts": []string{"low", "medium", "high", "xhigh", "ultra"},
 	}
@@ -677,6 +750,7 @@ func registration(cfg Config) map[string]any {
 				{"Name": "transport", "Type": "string", "Description": "上游传输方式：http（默认，正文增量、工具/推理终态回放）或 ws（WebSocket，整轮回放）。"},
 				{"Name": "proxy_url", "Type": "string", "Description": "WS 传输的出站代理 URL（仅 transport=ws 生效；http 传输走 CPA 全局 proxy-url），留空表示直连。"},
 				{"Name": "heartbeat_seconds", "Type": "integer", "Description": "流式心跳间隔（秒），默认 15；0 关闭（仅关闭心跳，http 正文增量不受影响）。无输出时防止长回合被下游空闲超时切断。"},
+				{"Name": "stream_tool_mode", "Type": "string", "Description": "http 流式在有可调用工具的回合如何交付：incremental（默认，正文边读边交付）或 buffered（整轮校验通过后再交付，交付前可重新生成一次，但首字延迟增大；无工具或 tool_choice=none 的回合不受影响）。"},
 				{"Name": "alpha_search_model", "Type": "string", "Description": "Basis Points 模型的 Codex 网页搜索（/v1/alpha/search）改由原生 codex 凭据处理时，用于挑选凭据的原生模型名（如 gpt-6-luna）；留空关闭。不能填 Basis Points 模型。"},
 			},
 		},

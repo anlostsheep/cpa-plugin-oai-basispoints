@@ -362,7 +362,8 @@ func TestAttachmentURLRemainsOnConfiguredOrigin(t *testing.T) {
 // host.http.do/do_stream 会先 operation_open、结束时 cancel），不影响各用例的线协议断言。
 func opTolerant(h HostCall) HostCall {
 	return func(method string, payload any, out any) error {
-		if method == "host.http.operation_open" || method == "host.http.cancel" {
+		// host.log（含 relay_summary 汇总）不是网络调用。
+		if method == "host.http.operation_open" || method == "host.http.cancel" || method == "host.log" {
 			return nil
 		}
 		return h(method, payload, out)

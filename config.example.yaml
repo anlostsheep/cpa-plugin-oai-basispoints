@@ -67,6 +67,14 @@ plugins:
       # 范围 0～120，默认 15。
       heartbeat_seconds: 15
 
+      # 有可调用工具的回合在 http 流式下如何交付（0.1.17.0 起）：
+      #   incremental（默认）：正文边读边交付；工具在终态整批校验。正文已交付后工具才校验失败时，
+      #     不能再重新生成，客户端收到 response.failed（invalid_tool_call）。
+      #   buffered：本轮有可调用工具时，正文与工具等整轮校验通过后再交付；失败的那次不交付，交付前
+      #     仍可重新生成一次。代价是这些回合看不到逐字输出（心跳照常）；无工具或 tool_choice=none
+      #     的回合、非流式与 ws 传输不受影响。不保证第二次生成一定成功。
+      stream_tool_mode: incremental
+
       # Codex 网页搜索改道（默认关闭）。codex-tui 的网页搜索单独请求 /v1/alpha/search，CPA 只用
       # 原生 codex 凭据处理它，Basis Points 模型会得到 auth_not_found（503）。填一个原生 codex
       # 能提供的模型名后，（不带凭据前缀的）Basis Points 模型的搜索请求改由 CPA 从原生 codex

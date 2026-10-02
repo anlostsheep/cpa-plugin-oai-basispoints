@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version        = "0.1.16.0"
+	Version        = "0.1.17.0"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -31,6 +31,11 @@ const (
 	// TransportHTTP：message 正文增量交付，工具/推理终态回放；TransportWS 走 WebSocket，整轮回放。
 	TransportHTTP = "http"
 	TransportWS   = "ws"
+
+	// StreamToolModeIncremental：http 流式下正文边读边交付（默认）；StreamToolModeBuffered：
+	// 本轮有可调用工具时整轮校验通过后再交付，交付前仍可重新生成一次。
+	StreamToolModeIncremental = "incremental"
+	StreamToolModeBuffered    = "buffered"
 
 	// DefaultHeartbeatSeconds：流式期间无输出时向客户端发送 response.in_progress 心跳的间隔，
 	// 需小于 sub2api stream_data_interval_timeout(180s) 与 Codex 空闲超时(300s)。0 关闭心跳。
@@ -105,6 +110,8 @@ type ExecutorRequest struct {
 	// deadline 是模型往返（首次 + 至多一次重新生成）共享的总截止时间，零值表示不限。
 	// timeout_seconds 约束的是整次客户端请求，重新生成不能重置它。
 	deadline time.Time
+	// summary 累计本次执行的工具中继汇总，收尾时写一条 relay_summary 日志。
+	summary *relaySummary
 }
 
 // roundTripTimeout 返回下一次上游往返可用的超时：设置了 deadline 时取剩余时长与配置的
@@ -174,6 +181,8 @@ type Config struct {
 	// AlphaSearchModel 非空时，Basis Points 模型的 Codex 网页搜索（/v1/alpha/search）改由
 	// 原生 codex 凭据处理，并用该原生模型名挑选凭据；留空表示关闭（默认）。
 	AlphaSearchModel string `yaml:"alpha_search_model" json:"alpha_search_model"`
+	// StreamToolMode 控制 http 流式在有可调用工具的回合如何交付：incremental（默认）或 buffered。
+	StreamToolMode string `yaml:"stream_tool_mode" json:"stream_tool_mode"`
 }
 
 func defaultConfig() Config {
@@ -191,6 +200,7 @@ func defaultConfig() Config {
 		ChromeVersion:    DefaultChromeVersion,
 		Transport:        TransportHTTP,
 		HeartbeatSeconds: intPtr(DefaultHeartbeatSeconds),
+		StreamToolMode:   StreamToolModeIncremental,
 	}
 }
 
@@ -277,6 +287,15 @@ func (c *Config) normalize() error {
 	case TransportHTTP, TransportWS:
 	default:
 		return fail(400, "invalid_config", "transport must be either \"http\" or \"ws\"")
+	}
+
+	c.StreamToolMode = strings.ToLower(strings.TrimSpace(c.StreamToolMode))
+	switch c.StreamToolMode {
+	case "":
+		c.StreamToolMode = StreamToolModeIncremental
+	case StreamToolModeIncremental, StreamToolModeBuffered:
+	default:
+		return fail(400, "invalid_config", "stream_tool_mode must be either \"incremental\" or \"buffered\"")
 	}
 
 	// ws 后备出站代理：与凭据 proxy_url 同一规则（CPA proxyutil.Parse）：留空、direct/none

@@ -38,6 +38,11 @@ type streamDelivery struct {
 	// forward 交付消息事件；commit 时带上 meta（会话尚未开流则据此开场），之后 meta 为 nil。
 	forward func(meta map[string]any, frames []map[string]any) error
 
+	// bufferUntilValidated（stream_tool_mode: buffered 且本轮有可调用工具）：message 事件照常
+	// 经状态机校验，但不 commit、不向客户端交付；终态整批校验通过后由会话完整回放。
+	// response.created 的 onMeta 照常触发，开流与心跳不受影响。
+	bufferUntilValidated bool
+
 	committed     bool
 	meta          map[string]any
 	pending       []map[string]any
@@ -146,6 +151,11 @@ func (d *streamDelivery) consume(event, data string) error {
 	default:
 		// reasoning / reasoning_summary、工具参数增量及其他 item 由完整终态保留，不作为正文提前暴露。
 		return nil
+	}
+	if d.bufferUntilValidated {
+		// 复用同一状态机核验缓冲事件，不提交、不交付；不一致直接失败（不当作工具格式错误重新生成）。
+		_, err := d.applyMessageEvent(value)
+		return err
 	}
 	if d.committed {
 		frame, err := d.applyMessageEvent(value)
@@ -286,13 +296,15 @@ func logprobsMatch(value any, logs []any) bool {
 	return bytes.Equal(jsonBytes(got), jsonBytes(logs))
 }
 
-// validateFinal 核对上游原始终态与已交付正文一致（在 transformResponseBody 之前调用，
-// 避免工具整批校验把不一致的终态写入历史身份缓存）。未 commit 时无需核对。
+// validateFinal 核对上游原始终态与已交付（或 buffered 下已缓冲校验）的正文一致（在
+// transformResponseBody 之前调用，避免工具整批校验把不一致的终态写入历史身份缓存）。
+// 增量模式未 commit 时无需核对；buffered 时即使未交付也要核对，meta 可为空（整体 JSON
+// 响应或只有终态事件）。
 func (d *streamDelivery) validateFinal(response map[string]any) error {
-	if !d.committed {
+	if !d.committed && !d.bufferUntilValidated {
 		return nil
 	}
-	if response["id"] != d.meta["id"] {
+	if d.meta != nil && response["id"] != d.meta["id"] {
 		return streamEventError()
 	}
 	output, _ := response["output"].([]any)

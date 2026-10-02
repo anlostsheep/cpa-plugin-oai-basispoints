@@ -708,6 +708,11 @@ func TestIncrementalDeadlineAbortsBlockedDownstream(t *testing.T) {
 	if upstreamCloses != 1 {
 		t.Fatalf("upstream closed %d times, want 1", upstreamCloses)
 	}
+	// 截止看门狗强关：汇总记 timeout，不能是 completed，也要记下已交付的正文。
+	rec := h.waitSummary(t)
+	if rec.Exit != "timeout" || rec.ErrorKind != "upstream_timeout" || !rec.TextCommitted {
+		t.Fatalf("forced-close summary wrong: %+v", rec)
+	}
 }
 
 // 同一块内：正文交付跨过截止时间后，随后的事件又不一致。守卫已记录的超时优先于回调的
@@ -991,6 +996,11 @@ func TestIncrementalShutdownBoundedWhenDeliveryStalls(t *testing.T) {
 	}
 	if n := closes.Load(); n != 1 {
 		t.Fatalf("host.stream.close must be called exactly once, got %d", n)
+	}
+	// shutdown 看门狗强关：汇总以强关原因为准（stopped），并记下已交付的正文。
+	rec := inner.waitSummary(t)
+	if rec.Exit != "stopped" || rec.ErrorKind != "plugin_stopped" || !rec.TextCommitted {
+		t.Fatalf("forced-close summary wrong: %+v", rec)
 	}
 }
 

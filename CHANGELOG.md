@@ -1,5 +1,29 @@
 # 更新日志
 
+## v0.1.17.0 — 2026-10-02（UTC）
+
+本版目标是提高工具调用的可靠性。移植原仓库 JaxsonWang/cpa-plugin-oai-basispoints（`a5f698d`，MIT）中的中继格式、提示词、历史回放与诊断修复，并新增逐请求的中继汇总日志和可选的 `buffered` 交付。外层仍是本 fork 的流会话（延迟心跳、失败分类、ws 传输、共享模式凭据）；未合并原仓库的 `streaming.go` / `request_lifecycle.go` / `websocket.go` / `executor_protocol.go`。
+
+### 变更
+
+- **中继格式改为 `references` + 纯载荷**（原仓库 v0.1.14 #11）：外层 `run_officejs` 的 `references` 恰好列出一个完整工具名，`code` 只放该工具的载荷且始终是字符串（function 为参数 JSON 文本，custom 为原文）。不再使用内层 `{tool,args}` 封装。
+- **提示词**（原仓库 v0.2.8）：只为本轮可调用的工具生成示例，并写明 function 参数的两层 JSON 序列化；协议说明、回合提醒和重新生成提示都改为新格式，不再教 `references=[]`。
+- **过渡期兼容旧格式输出**：`references` 缺失或恰好为 `[]`，且 `code` 是合法的旧 `{tool,args}` 封装时，仍按旧路由接受并计数（`legacy`）；`references` 为其他任何值都严格按新格式处理，不回退。是否移除兼容由 0.1.18 起根据计数决定。
+- **收窄旧解析器的宽容**：不再接受对象型 `code`、嵌套 `run_officejs`，也不再对整个 `code` 额外解码一层；只有 function 参数恰好多套一层 JSON 字符串时允许解码一次；custom 原文从不解码。
+- **历史回放**（原仓库 PR #14）：历史调用的重建不再依赖当前工具目录，缓存未命中时按新格式重建；custom 调用的 item id 使用 `ctc_` 前缀。缓存命中的旧原生调用原样回放。
+- **诊断**（原仓库 `54cdb68`，只取诊断部分）：区分「目录里有但本轮 `tool_choice` 不允许」（`tool_not_allowed_by_tool_choice`）与「未声明」（`tool_not_in_catalog`）。只是让诊断更准，没有证据表明它会降低模型出错率；由于诊断会写进重新生成提示，可能影响重新生成的成功率。不移植 `d94fd04` 的 JSON 自动修补与历史条目黑名单（原仓库已撤回）。
+
+### 新增
+
+- **逐请求中继汇总日志** `basispoints: relay_summary {...}`：每次执行发送一条，记录首次 / 最终工具校验结果、重新生成结局、旧格式接受数、交付方式与退出原因，不含任何内容。JSON 写在日志正文里（CPA 7.3.20 的日志格式会丢弃插件自定义字段）。正常收尾时在 `host.stream.close` 之前写出，以便带上宿主 request_id；看门狗强制关流不等待日志，汇总随后补记（以强关原因为 exit，可能不带 request_id）。`host.log` 失败时该条汇总会缺失。字段与口径见 README「中继汇总日志」。原有三条计数日志保持不变。
+- **`stream_tool_mode`**（默认 `incremental`，可选 `buffered`；思路来自原仓库 #21）：`buffered` 时，http 流式下本轮有可调用工具的回合等整轮校验通过后再交付，失败的那次不交付，交付前仍可重新生成一次；开流、心跳、客户端 response id、共享截止时间和失败分类不变。暂不交付期间照常校验 message 事件与终态一致性，不一致直接失败、不重新生成。代价是这些回合看不到逐字输出；无工具或 `tool_choice: none` 的回合、非流式与 ws 传输不受影响。不保证第二次生成一定成功。
+
+### 说明
+
+- 未带 `prompt_cache_key` 的请求，`task_id` / `turn_id` 由转换后的会话指纹推导；历史重建改为新格式后，这类请求的指纹会与旧版本不同（Codex CLI 总会带 `prompt_cache_key`，不受影响）。
+- 原仓库 v0.2.4 的图片修复（#17 只发 `type` + `file_id`、#15 按字节签名识别格式）本版未包含，按计划拆到 0.1.17.1。
+- 本地验证：`go test -race`；用未修改的 CPA v7.3.20 加载本地 darwin/arm64 构建做隔离联调（合成凭据与合成上游），确认汇总日志可见且带 request_id。这不等于真实上游或现网部署验收。
+
 ## v0.1.16.0 — 2026-09-28（UTC）
 
 本版起 fork 使用**四段纯数字版本号**（见 README「版本号」）。增量交付状态机移植自原仓库 JaxsonWang/cpa-plugin-oai-basispoints v0.1.18（`11df6f8`，`stream_events.go`，MIT），消息内容逐段回放移植自原仓库 #12；外层沿用本 fork 的流会话（延迟心跳、失败分类、ws 传输、共享模式凭据），未合并原仓库的 `streaming.go` / `request_lifecycle.go` / `websocket.go`。

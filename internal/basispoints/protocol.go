@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +18,9 @@ import (
 const (
 	transportName       = "run_officejs"
 	transportAlias      = "functions.run_officejs"
-	transportRetryHint  = "The previous run_officejs relay was malformed. Retry once with exactly one outer run_officejs call; code is JSON text containing one catalog-tool object, not JavaScript."
+	transportRetryHint  = "The previous run_officejs relay was malformed. Retry once using exactly one client tool name in outer references and only its payload in code: a JSON arguments object for function tools, or unchanged raw input for custom tools. Do not wrap the payload in a tool/args object. " + functionRelayEncoding
 	toolCatalogPrefix   = "This request is relayed by an external Responses API client, not by the live Excel workbook. The native run_officejs function is a transport endpoint owned by this proxy. The proxy intercepts it before execution, so it never runs Office code or changes the workbook."
-	toolCatalogReminder = "Reminder: use the outer native run_officejs transport; put exactly one JSON object as JSON text in code. The inner name must be one catalog client tool and must never be run_officejs or functions.run_officejs."
+	toolCatalogReminder = "Reminder: use the outer native run_officejs transport. Set references to an array containing exactly one catalog client tool name; put only that tool payload in code. Never put a tool/args wrapper in code or route to run_officejs or functions.run_officejs."
 )
 
 type toolSpec struct {
@@ -192,9 +193,13 @@ func clientToolProtocolInstructions(source map[string]any) string {
 	if parallel, ok := source["parallel_tool_calls"].(bool); ok && !parallel {
 		catalogText += "\nInvoke at most one client tool in this response."
 	}
-	return toolCatalogPrefix + " Other native server-injected Excel, Office, connector, workbook, list_skills, and web-search tools are unavailable. Never claim shell, filesystem, or workspace access is unavailable when the catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool through run_officejs. Transport has two layers and they must not be mixed: the outer native tool is run_officejs (some hosts display it as functions.run_officejs); the inner code value is JSON text containing exactly one compact JSON object for one catalog client tool. For a function tool, use this shape: outer arguments include summary, extended_summary, destructive=false, references=[], and code equal to {\"tool\":\"exec_command\",\"args\":{\"cmd\":\"pwd\"}}. For a custom tool, code instead contains {\"tool\":\"TOOL_NAME\",\"args\":\"RAW_INPUT\"}. Do not put JavaScript, OfficeJS, a second run_officejs envelope, or a functions.run_officejs wrapper inside code. The field is named code for compatibility; it is not JavaScript. Serialize the complete inner object before placing it there, including backslashes and quotes. The proxy converts this native call into the real client tool call, then replays the original run_officejs identity with the client tool result on the next request. Interpret that result as the named client tool output. Never repeat a tool request whose output is already present. Available client tools:\n" + catalogText + "\n" + toolCatalogReminder +
-		" Remember: use a separate outer native run_officejs call for each client tool invocation; put exactly one catalog-tool JSON object in its code field." +
-		" The available catalog is authoritative for tool names and arguments."
+	names := make([]string, 0, len(specs))
+	for name := range specs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return toolCatalogPrefix + " Other native server-injected Excel, Office, connector, workbook, list_skills, and web-search tools are unavailable. Never claim shell, filesystem, or workspace access is unavailable when the catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool through run_officejs. Set outer references to an array containing exactly one fully qualified client tool name from the catalog; references is the routing field, not a list of files or cells. Set outer code to only that tool's payload. For a function tool, code contains one JSON object of arguments. " + functionRelayEncoding + " For a custom tool, code contains the exact raw input text, not JSON: preserve every quote, backslash, newline and space without another encoding layer. The proxy parses function arguments but does not parse custom input. Serialize the outer arguments object once. Do not put JavaScript wrappers, Markdown fences, a tool/args envelope, or another run_officejs call around the payload. Historical calls may contain the old tool/args envelope; do not copy that format into new calls." + clientToolRelayExamples(names, specs) + " The proxy converts this native call into the real client tool call, then replays the original run_officejs identity with the client tool result on the next request. Interpret that result as the named client tool output. Never repeat a tool request whose output is already present. Available client tools:\n" + catalogText + "\n" + toolCatalogReminder +
+		" Use a separate outer native run_officejs call for each client tool invocation. The available catalog is authoritative for tool names and arguments."
 }
 
 func describeParameterNames(parameters map[string]any) string {
@@ -243,10 +248,10 @@ func clientToolProtocolReminder(source map[string]any) string {
 			}
 		}
 	}
-	reminder := toolCatalogReminder + " Example inner code: {\"tool\":\"exec_command\",\"args\":{\"cmd\":\"pwd\"}}. Do not merely say you will act; make the tool call. Client tools: " + strings.Join(names, ", ") + ". Other native tools are unavailable."
-	for name, spec := range specs {
-		if spec.Type == "custom" {
-			reminder += " Custom tool " + name + " uses input, not arguments."
+	reminder := toolCatalogReminder + " " + functionRelayEncoding + " Do not merely say you will act; make the tool call. Client tools: " + strings.Join(names, ", ") + ". Other native tools are unavailable."
+	for _, name := range names {
+		if specs[name].Type == "custom" {
+			reminder += " Custom tool " + name + " takes raw input directly in code; do not JSON-encode that input."
 		}
 	}
 	return reminder
@@ -334,18 +339,18 @@ func fallbackTransportCall(item map[string]any) map[string]any {
 	if callID == "" {
 		callID = "call_bp_" + shortHash(fmt.Sprintf("%v", time.Now().UnixNano()))
 	}
-	inner := map[string]any{"tool": name}
+	// 按新中继格式重建（移植自上游 1b9359a / 019e97d）：references 指定工具，code 只放载荷；
+	// function 载荷是参数 JSON 文本原样，custom 载荷是原文。
+	payload, _ := item["arguments"].(string)
 	if stringValue(item["type"]) == "custom_tool_call" {
-		inner["args"], _ = item["input"].(string)
-	} else {
-		inner["args"] = parseArguments(item["arguments"])
+		payload, _ = item["input"].(string)
 	}
 	outerArguments := map[string]any{
 		"summary":          "Run client tool " + name,
 		"extended_summary": "Relay " + name + " through the external client",
-		"code":             string(jsonBytes(inner)),
+		"code":             payload,
 		"destructive":      false,
-		"references":       []any{},
+		"references":       []any{name},
 	}
 	return map[string]any{
 		"type":      "function_call",
@@ -357,7 +362,10 @@ func fallbackTransportCall(item map[string]any) map[string]any {
 	}
 }
 
-func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
+// translateInputItems 把客户端历史转换为上游输入。历史调用自身已带名称与载荷，重建不依赖
+// 当前工具目录（压缩请求等可能没有目录；移植自上游 PR #14 019e97d）。缓存里的原生调用
+// 原样回放（可能是旧 {tool,args} 封装），不按新输出的规则校验。
+func translateInputItems(rawInput any) []any {
 	if text, ok := rawInput.(string); ok {
 		return []any{messageItem("user", text)}
 	}
@@ -392,14 +400,10 @@ func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
 				result = append(result, item)
 				continue
 			}
-			if _, exists := allowed[name]; exists {
-				if callID != "" {
-					origins[callID] = transportName
-				}
-				result = append(result, fallbackTransportCall(item))
-				continue
+			if callID != "" {
+				origins[callID] = transportName
 			}
-			result = append(result, item)
+			result = append(result, fallbackTransportCall(item))
 			continue
 		}
 		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
@@ -568,7 +572,7 @@ func prepareResponsesBody(source map[string]any, cfg Config) (map[string]any, er
 	if clientToolCallRequired(source) && len(callableClientToolSpecs(source)) == 0 {
 		return nil, fail(400, "invalid_tool_choice", "tool_choice does not select any available client tool")
 	}
-	inputItems := translateInputItems(source["input"], clientToolSpecs(source))
+	inputItems := translateInputItems(source["input"])
 	historyRoot := conversationFingerprint(inputItems)
 	prologue := []any{}
 	if instructions := stringValue(source["instructions"]); instructions != "" {
@@ -686,9 +690,10 @@ func parseRelayObject(value any) (map[string]any, string) {
 	return object, ""
 }
 
-// decodeTransportCode 解析 run_officejs 的 code 字段。首次按原样解析；失败时只重试一次
-// 无副作用的纯解析（剥掉一层多余的 JSON 字符串转义后再解析），仍失败时返回首次的诊断原因。
-func decodeTransportCode(value any) (map[string]any, string) {
+// decodeFunctionArguments 解析 function 工具的参数载荷：对象原样接受（旧封装里的 args 本就
+// 是对象）；字符串先按原样解析为一个 JSON 对象，失败时只再试一次有界的纯解析——载荷整体
+// 恰好是一个多套了一层的 JSON 字符串时剥掉这一层。custom 载荷从不经过这里。
+func decodeFunctionArguments(value any) (map[string]any, string) {
 	object, reason := parseRelayObject(value)
 	if reason == "" {
 		return object, ""
@@ -710,33 +715,60 @@ func relayError(reason string) error {
 	return fail(422, "invalid_tool_call", "Basis Points returned an invalid client tool relay: "+reason)
 }
 
-func transportEnvelope(native map[string]any) (map[string]any, error) {
+// relayCall 是从 run_officejs 外层解析出的路由结果。payload 为工具载荷：新格式下始终是
+// 字符串（function 为参数 JSON 文本，custom 为原文）；旧封装下是 args 的原值。
+type relayCall struct {
+	tool    string
+	payload any
+	legacy  bool
+	// payloadLabel 是诊断前缀：新格式为 code，旧封装为 arguments（与旧版诊断一致）。
+	payloadLabel string
+}
+
+// transportEnvelope 解析 run_officejs 外层参数，只决定路由，不解析 function 载荷。
+//
+//   - references 键存在且不是空数组：严格按新格式——恰好一个合法的完整工具名，code 为字符串。
+//     null、类型错误、多个元素、非法名称都拒绝，不回退旧规则。
+//   - references 键不存在或恰好是 []（过渡期兼容，0.1.17.0 起）：code 必须是字符串，且严格
+//     解析为旧的 {"tool":…,"args":…} 封装。不恢复旧解析器的其他宽容：对象型 code、嵌套
+//     run_officejs、对整个 code 的额外字符串解码都不再接受。
+func transportEnvelope(native map[string]any) (relayCall, error) {
 	if !isTransportCall(native) {
-		return nil, relayError("outer_not_transport")
+		return relayCall{}, relayError("outer_not_transport")
 	}
 	arguments, reason := parseRelayObject(native["arguments"])
 	if reason != "" {
-		return nil, relayError("outer_arguments " + reason)
+		return relayCall{}, relayError("outer_arguments " + reason)
 	}
-	for depth := 0; ; depth++ {
-		if _, ok := arguments["code"].(string); !ok && objectValue(arguments["code"]) == nil {
-			return nil, relayError("code_not_string")
+	references, hasReferences := arguments["references"]
+	if list, isList := references.([]any); hasReferences && !(isList && len(list) == 0) {
+		if !isList || len(list) != 1 {
+			return relayCall{}, relayError("references_invalid")
 		}
-		envelope, reason := decodeTransportCode(arguments["code"])
-		if reason != "" {
-			return nil, relayError("code " + reason)
+		name, ok := list[0].(string)
+		if !ok || strings.TrimSpace(name) == "" || name != strings.TrimSpace(name) || isTransportName(name) {
+			return relayCall{}, relayError("references_invalid")
 		}
-		if !isTransportName(stringValue(envelope["name"])) {
-			return envelope, nil
+		code, ok := arguments["code"].(string)
+		if !ok {
+			return relayCall{}, relayError("code_not_string")
 		}
-		if depth >= 2 {
-			return nil, relayError("nested_transport_depth")
-		}
-		arguments, reason = parseRelayObject(envelope["arguments"])
-		if reason != "" {
-			return nil, relayError("nested_arguments " + reason)
-		}
+		return relayCall{tool: name, payload: code, payloadLabel: "code"}, nil
 	}
+	code, ok := arguments["code"].(string)
+	if !ok {
+		return relayCall{}, relayError("code_not_string")
+	}
+	envelope, reason := parseRelayObject(code)
+	if reason != "" {
+		return relayCall{}, relayError("code " + reason)
+	}
+	name, ok := envelope["tool"].(string)
+	args, hasArgs := envelope["args"]
+	if !ok || name == "" || isTransportName(name) || !hasArgs || len(envelope) != 2 {
+		return relayCall{}, relayError("legacy_envelope_invalid")
+	}
+	return relayCall{tool: name, payload: args, legacy: true, payloadLabel: "arguments"}, nil
 }
 
 func schemaMatches(value any, schema map[string]any) bool {
@@ -829,24 +861,28 @@ func schemaMatches(value any, schema map[string]any) bool {
 }
 
 func extractNativeClientToolCall(native map[string]any, specs map[string]toolSpec) (map[string]any, error) {
-	inner, err := transportEnvelope(native)
+	call, _, err := extractNativeClientToolCallIn(native, specs, specs)
+	return call, err
+}
+
+// extractNativeClientToolCallIn 把一个 run_officejs 中转调用还原为客户端工具调用。callable 是
+// 本轮允许的工具，declared 是完整目录：目录里有但本轮不允许时报 tool_not_allowed_by_tool_choice，
+// 真正未声明时报 tool_not_in_catalog（诊断移植自上游 54cdb68）。第二个返回值表示是否为旧封装。
+func extractNativeClientToolCallIn(native map[string]any, callable, declared map[string]toolSpec) (map[string]any, bool, error) {
+	relay, err := transportEnvelope(native)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	name := stringValue(inner["tool"])
-	if name == "" {
-		name = stringValue(inner["name"])
-	}
-	if name == "" || isTransportName(name) {
-		return nil, relayError("invalid_inner_tool")
-	}
-	spec, exists := specs[name]
+	spec, exists := callable[relay.tool]
 	if !exists {
-		return nil, relayError("tool_not_in_catalog")
+		if _, declaredOnly := declared[relay.tool]; declaredOnly {
+			return nil, false, relayError("tool_not_allowed_by_tool_choice")
+		}
+		return nil, false, relayError("tool_not_in_catalog")
 	}
 	callID := stringValue(native["call_id"])
 	if callID == "" {
-		return nil, relayError("missing_call_id")
+		return nil, false, relayError("missing_call_id")
 	}
 	result := map[string]any{
 		"type":    "function_call",
@@ -861,46 +897,51 @@ func extractNativeClientToolCall(native map[string]any, specs map[string]toolSpe
 		result["namespace"] = spec.Namespace
 	}
 	if spec.Type == "custom" {
-		input := inner["input"]
-		if input == nil {
-			input = inner["args"]
-		}
-		if _, ok := input.(string); !ok {
-			return nil, relayError("custom_args_not_string")
+		// custom 载荷是原文：逐字保留，不做任何 JSON 解码。
+		input, ok := relay.payload.(string)
+		if !ok {
+			return nil, false, relayError("custom_args_not_string")
 		}
 		result["type"] = "custom_tool_call"
+		// custom 调用用 ctc_ 前缀的 item id（上游 PR #14），兼容旧的 fc_。
+		result["id"] = "ctc_" + strings.TrimPrefix(stringValue(result["id"]), "fc_")
 		result["input"] = input
 	} else {
-		arguments := inner["args"]
-		if arguments == nil {
-			arguments = inner["arguments"]
-		}
-		parsed, reason := parseRelayObject(arguments)
+		parsed, reason := decodeFunctionArguments(relay.payload)
 		if reason != "" {
-			return nil, relayError("arguments " + reason)
+			return nil, false, relayError(relay.payloadLabel + " " + reason)
 		}
 		if !schemaMatches(parsed, firstMap(spec.Spec, "parameters", "inputSchema", "input_schema")) {
-			return nil, relayError("arguments_schema_mismatch")
+			return nil, false, relayError("arguments_schema_mismatch")
 		}
 		result["arguments"] = string(jsonBytes(parsed))
 		result["status"] = "completed"
 	}
-	return result, nil
+	return result, relay.legacy, nil
 }
 
 func transformResponseBody(body []byte, source map[string]any) ([]byte, map[string]any, bool, error) {
+	payload, response, changed, _, err := transformResponseBodyStats(body, source)
+	return payload, response, changed, err
+}
+
+// transformResponseBodyStats 同 transformResponseBody，另返回整批转换的计数（供 relay_summary）。
+func transformResponseBodyStats(body []byte, source map[string]any) ([]byte, map[string]any, bool, relayStats, error) {
+	var stats relayStats
 	var response map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.UseNumber()
 	if err := decoder.Decode(&response); err != nil || response == nil {
-		return nil, nil, false, fail(502, "invalid_upstream_response", "Basis Points returned invalid JSON")
+		return nil, nil, false, stats, fail(502, "invalid_upstream_response", "Basis Points returned invalid JSON")
 	}
 	var extra any
 	if decoder.Decode(&extra) != io.EOF {
-		return nil, nil, false, fail(502, "invalid_upstream_response", "Basis Points returned trailing response data")
+		return nil, nil, false, stats, fail(502, "invalid_upstream_response", "Basis Points returned trailing response data")
 	}
 	output, _ := response["output"].([]any)
 	specs := callableClientToolSpecs(source)
+	declared := clientToolSpecs(source)
+	legacy := 0
 	replaced := make([]any, 0, len(output))
 	natives := make([]map[string]any, 0)
 	callIDs := map[string]bool{}
@@ -910,14 +951,17 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 			replaced = append(replaced, value)
 			continue
 		}
-		call, err := extractNativeClientToolCall(item, specs)
+		call, isLegacy, err := extractNativeClientToolCallIn(item, specs, declared)
+		if isLegacy {
+			legacy++
+		}
 		if err != nil {
 			// 不把服务器注入工具或损坏的中转载荷交给客户端执行；原因写进 422 诊断。
-			return nil, nil, false, err
+			return nil, nil, false, stats, err
 		}
 		callID := stringValue(call["call_id"])
 		if callIDs[callID] {
-			return nil, nil, false, relayError("duplicate_call_id")
+			return nil, nil, false, stats, relayError("duplicate_call_id")
 		}
 		callIDs[callID] = true
 		replaced = append(replaced, call)
@@ -925,18 +969,20 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 	}
 	if len(natives) == 0 {
 		if clientToolCallRequired(source) {
-			return nil, nil, false, relayError("required_tool_choice_not_satisfied")
+			return nil, nil, false, stats, relayError("required_tool_choice_not_satisfied")
 		}
-		return body, response, false, nil
+		return body, response, false, stats, nil
 	}
 	if parallel, ok := source["parallel_tool_calls"].(bool); ok && !parallel && len(natives) > 1 {
-		return nil, nil, false, relayError("parallel_tool_calls_disabled")
+		return nil, nil, false, stats, relayError("parallel_tool_calls_disabled")
 	}
 	for _, native := range natives {
 		rememberNativeCall(native)
 	}
+	// 只有整批校验通过才计入（失败批次已在上面返回）。
+	stats.Calls, stats.Legacy = len(natives), legacy
 	response["output"] = replaced
-	return jsonBytes(response), response, true, nil
+	return jsonBytes(response), response, true, stats, nil
 }
 
 // sseEvent 是一条待写出的 SSE 事件（尚未赋 sequence_number）。

@@ -45,6 +45,31 @@ type streamSession struct {
 	ended     chan struct{}
 	endOnce   sync.Once
 	lifeCtx   context.Context
+
+	// onEnd 在正常收尾的 host.stream.close 之前调用至多一次（宿主在关流后不再保留请求上下文，
+	// 之后写的日志拿不到 request_id）。endOutcome / endErr 由收尾方在关流前设置：outcome 为空
+	// 时按 err 推断。onEnd 在 closeOnce 之外调用：即使它（经 host.log）阻塞，看门狗仍能强制关流。
+	// 看门狗强制关流不调用 onEnd，原因记在 forceReason，由往返收尾时补记汇总。
+	onEnd       func(outcome string, err error)
+	endHookOnce sync.Once
+	endMu       sync.Mutex
+	endOutcome  string
+	endErr      error
+	forceReason error // 赢得关闭权的强制关流原因（shutdown 强关记为 plugin_stopped）
+}
+
+// forcedBy 返回赢得关闭权的强制关流原因；不是强关时返回 nil。
+func (ss *streamSession) forcedBy() error {
+	ss.endMu.Lock()
+	defer ss.endMu.Unlock()
+	return ss.forceReason
+}
+
+// setEnd 记录收尾结果，供关流前的 onEnd 使用。
+func (ss *streamSession) setEnd(outcome string, err error) {
+	ss.endMu.Lock()
+	ss.endOutcome, ss.endErr = outcome, err
+	ss.endMu.Unlock()
 }
 
 // shutdownForceGrace 是插件停止后给会话正常收尾（发 response.failed 并关闭）的宽限期；
@@ -285,8 +310,27 @@ func (ss *streamSession) closeStream(err error) {
 
 // closeWith 恰好一次地关闭宿主流；force 为真时在关闭前发布 forced（仅当本次赢得关闭权）。
 func (ss *streamSession) closeWith(err error, force bool) {
+	if !force && ss.onEnd != nil && !ss.forced.Load() {
+		ss.endHookOnce.Do(func() {
+			ss.endMu.Lock()
+			outcome, endErr := ss.endOutcome, ss.endErr
+			ss.endMu.Unlock()
+			if endErr == nil {
+				endErr = err
+			}
+			ss.onEnd(outcome, endErr)
+		})
+	}
 	ss.closeOnce.Do(func() {
 		if force {
+			reason := err
+			if reason == nil {
+				// 静默强关只来自插件停止（shutdown 看门狗，或截止时插件已停止）。
+				reason = stoppedError()
+			}
+			ss.endMu.Lock()
+			ss.forceReason = reason
+			ss.endMu.Unlock()
 			ss.forced.Store(true)
 		}
 		payload := map[string]any{"stream_id": ss.streamID}
@@ -297,13 +341,21 @@ func (ss *streamSession) closeWith(err error, force bool) {
 	})
 }
 
+// 收尾结果（供 relay_summary 的 exit）：只有真正把终态写给客户端才算 completed。
+const (
+	finishCompleted    = "completed"
+	finishStopped      = "stopped"
+	finishDisconnected = "cancelled"
+)
+
 // finish 回放已转换的完整响应并正常关闭。已开流时 id 统一为会话 id，并省略已发出的开场事件。
-func (ss *streamSession) finish(response map[string]any) {
-	ss.finishWith(response, nil)
+func (ss *streamSession) finish(response map[string]any) string {
+	return ss.finishWith(response, nil)
 }
 
 // finishWith 同 finish；keep 非 nil 时（增量交付已 commit）只回放 keep 保留的事件。
-func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent) bool) {
+// 返回实际收尾结果：插件已停止、客户端已断开或终态写出失败时都不算 completed。
+func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent) bool) string {
 	defer ss.markEnded()
 	ss.stop()
 	ss.mu.Lock()
@@ -311,12 +363,13 @@ func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent
 	// 最终输出边界的停止检查：插件已停止时不再回放完整响应。
 	if ss.lifeCtx != nil && stoppedByShutdown(ss.lifeCtx) {
 		ss.failLocked(stoppedError())
-		return
+		return finishStopped
 	}
 	if ss.disconnected || ss.forced.Load() {
 		ss.closed = true
+		ss.setEnd(finishDisconnected, nil)
 		ss.closeStream(nil)
-		return
+		return finishDisconnected
 	}
 	var events []sseEvent
 	if ss.started {
@@ -335,9 +388,15 @@ func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent
 	} else {
 		events = syntheticEvents(response, true)
 	}
-	_ = ss.emitLocked(events, true)
+	emitErr := ss.emitLocked(events, true)
 	ss.closed = true
+	outcome := finishCompleted
+	if emitErr != nil || ss.disconnected || ss.forced.Load() {
+		outcome = finishDisconnected
+	}
+	ss.setEnd(outcome, nil)
 	ss.closeStream(nil)
+	return outcome
 }
 
 // fail 按错误来源决定：凭据/限流/传输错误带 error 关闭（CPA 冷却或换号）；请求层面的错误
@@ -353,9 +412,11 @@ func (ss *streamSession) fail(err error) {
 func (ss *streamSession) failLocked(err error) {
 	defer func() { ss.closed = true }()
 	if ss.disconnected || ss.forced.Load() || errors.Is(err, errClientDisconnected) || isKind(err, "client_disconnected") {
+		ss.setEnd(finishDisconnected, err)
 		ss.closeStream(nil)
 		return
 	}
+	ss.setEnd("", err)
 	if !isRequestScoped(err) {
 		ss.closeStream(err)
 		return
@@ -367,7 +428,10 @@ func (ss *streamSession) failLocked(err error) {
 		// 未提前发出开场事件时补上 created，保证客户端事件序列完整。
 		events = append([]sseEvent{{name: "response.created", value: map[string]any{"response": ss.placeholderResponse("in_progress")}}}, events...)
 	}
-	_ = ss.emitLocked(events, true)
+	if ss.emitLocked(events, true) != nil {
+		// response.failed 没能交给宿主流（客户端此时已断开）：收尾结果是断开，不是 failed。
+		ss.setEnd(finishDisconnected, err)
+	}
 	ss.closeStream(nil)
 }
 

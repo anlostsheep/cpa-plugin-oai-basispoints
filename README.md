@@ -47,10 +47,34 @@ make build
 
 ## 协议边界
 
-- http 流式下 message 正文边读边转发；工具调用、推理与推理摘要在终态整批给出，终态须与已转发正文一致。
+- http 流式下 message 正文边读边转发；工具调用、推理与推理摘要在终态整批给出，终态须与已转发正文一致。`stream_tool_mode: buffered`（默认 `incremental`）时，本轮有可调用工具的回合改为整轮校验通过后再交付：失败的那次不交付，交付前仍可重新生成一次，代价是这些回合看不到逐字输出；无工具或 `tool_choice: none` 的回合不受影响，非流式与 ws 传输不受影响。
 - 上游请求始终带 `Authorization: Bearer <access_token>`、`chatgpt-account-id`、`x-openai-account-id` 和 `x-basispoints-auth-mode: chatgpt`。
 - `turn_id` 按会话和当前用户 turn 稳定生成；工具结果回合只递增 `agent_iteration`，不会把同一 turn 重新当成新计划。
-- 工具 `code` 是嵌套 JSON 字符串，不是 JavaScript。插件只解析它，不执行其中内容。
+- 工具中继（0.1.17.0 起）：外层 `run_officejs` 的 `references` 恰好列出一个完整工具名，`code` 只放该工具的载荷且始终是字符串——function 为参数 JSON 对象的文本，custom 为原文（逐字保留，不做 JSON 解码）。插件只解析它，不执行其中内容。
+- 过渡期兼容：`references` 缺失或恰好为 `[]`，且 `code` 是合法的旧 `{"tool":…,"args":…}` 封装时，仍按旧路由接受（汇总里记为 `legacy`）；`references` 为其他任何值都严格按新格式处理。旧解析器的其他宽容（对象型 `code`、嵌套 `run_officejs`、对整个 `code` 再解码一层）不再接受；只有 function 参数恰好多套一层 JSON 字符串时允许解码一次。历史里的旧格式调用原样回放。
+- 工具调用失败的诊断区分「目录里有但本轮 `tool_choice` 不允许」（`tool_not_allowed_by_tool_choice`）与「未声明」（`tool_not_in_catalog`）；custom 调用的 item id 使用 `ctc_` 前缀。
+
+## 中继汇总日志（0.1.17.0 起）
+
+每次执行在收尾时经 `host.log` 发送一条汇总，正文形如 `basispoints: relay_summary {...}`（CPA 的日志格式只保留 message，所以 JSON 写在正文里）。正常收尾时在 `host.stream.close` 之前写出，日志行带宿主 request_id；被看门狗强制关流（超时、插件停止）时，关流不等待日志，汇总在往返协程收尾时补记，可能不带 request_id。`host.log` 失败时插件不重试，该条汇总会缺失。汇总是收尾时的快照：开始写之前若已被强关，以强关原因为准；开始写之后才发生的强关（例如 `host.log` 阻塞期间截止看门狗关流）不会再反映到这条记录里。字段只含类别与计数，不含请求或响应内容、工具参数、凭据：
+
+| 字段 | 含义 |
+|---|---|
+| `v`、`version`、`model` | 格式版本、插件版本、客户端模型别名 |
+| `transport`、`stream` | `http` / `ws`；是否流式 |
+| `config_mode`、`delivery` | 配置的 `stream_tool_mode`；实际交付方式 `incremental` / `buffered` / `terminal`（ws）/ `non_stream` |
+| `tool_callable` | 本轮是否有可调用的客户端工具；请求无法解析时为 `null` |
+| `attempts_started` | 发起的上游往返次数（首次 + 重新生成） |
+| `text_committed` | 工具校验前正文是否已进入提交 / 交付边界（插件开始把正文交给宿主流；不证明客户端已收到） |
+| `first`、`final` | 本次执行内第一次有效的工具校验结果 / 最后一次尝试的工具校验结果：`not_run`、`no_call`、`ok`、`legacy`、`invalid:<原因>`。重新生成开始时 `final` 重置为 `not_run`，所以重新生成那次因上游错误中止时 `final` 是 `not_run`，不会残留第一次的 `invalid` |
+| `regen` | 重新生成结局：`none`、`success`、`exhausted`（重新生成后仍失败）、`aborted`（重新生成后未走到校验） |
+| `legacy_calls` | 按旧封装接受的调用数（只在整批校验通过时累计） |
+| `exit` | `completed`（终态已交给宿主流，不代表客户端一定收到）、`incomplete`、`failed`、`cancelled`（客户端断开，包括失败事件没能交给宿主流）、`timeout`、`stopped`、`prepare_error`、`connect_error`、`upstream_error`。被看门狗强制关流时以强关原因为准（`timeout` / `stopped`），快照语义见上 |
+| `error_kind` | 失败时的错误类别 |
+
+`<原因>` 为白名单：`invalid_json`、`trailing_content`、`not_object`、`references_invalid`、`code_not_string`、`legacy_envelope_invalid`、`tool_not_in_catalog`、`tool_not_allowed_by_tool_choice`、`arguments_schema_mismatch`、`custom_args_not_string`、`missing_call_id`、`duplicate_call_id`、`parallel_limit`、`required_tool_choice_not_satisfied`、`outer_not_transport`、`other`。
+
+统计口径：一条记录对应一次宿主执行；同一 request_id 有多条时，请求级结局取最后一条，尝试次数与重复执行数按全部记录统计。用户可见的最终工具失败须同时满足：`final` 以 `invalid:` 开头、`exit=failed`、`error_kind=invalid_tool_call`。`final` 只描述最后一次尝试的校验结果，不能单独使用：例如首次校验失败、决定重新生成后截止时间已到，`final` 仍是首次的 `invalid`，但 `exit=timeout`、`regen=aborted`。`aborted`、`timeout`、`stopped`、`cancelled` 按 `exit` / `error_kind` 分开报告，不计入工具失败。「工具校验通过」不等于「已成功交付」：交付时插件停止或客户端断开，`exit` 分别记为 `stopped`、`cancelled`。原有三条计数日志的文本保持不变。
 - 未能从 OAuth JWT 或凭据字段得到账号 ID、token 过期、上游返回非 2xx、工具名不在客户端目录中时，插件会报告明确错误，不伪造成功。
 
 ---

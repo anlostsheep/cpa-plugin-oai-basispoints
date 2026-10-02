@@ -236,22 +236,36 @@ func TestErrorClassificationBySource(t *testing.T) {
 		}
 	})
 
-	// 容错解析：双重 JSON 转义的 code 应被恢复（一次纯解析重试），而非报错。
-	t.Run("tolerant_double_encoded_code", func(t *testing.T) {
+	// 容错解析（0.1.17.0 起收窄）：多一层 JSON 字符串编码只对 function 参数载荷做一次纯解析
+	// 重试；旧 {tool,args} 封装整体被多套一层时不再恢复（不恢复旧解析器的其他宽容）。
+	t.Run("tolerant_double_encoded_function_payload", func(t *testing.T) {
 		source := namespaceTestSource("function", "js", "mcp__node_repl")
-		inner := string(jsonBytes(map[string]any{"tool": "mcp__node_repl.js", "args": map[string]any{"code": "ok"}}))
-		doubleEncoded, _ := json.Marshal(inner) // 把 code 再套一层 JSON 字符串转义
+		argsJSON := string(jsonBytes(map[string]any{"code": "ok"}))
+		doubleEncoded, _ := json.Marshal(argsJSON) // 参数 JSON 再套一层字符串转义
 		native := map[string]any{
 			"type": "function_call", "name": transportName, "id": "fc_y", "call_id": "call_y",
-			"arguments": string(jsonBytes(map[string]any{"code": string(doubleEncoded)})),
+			"arguments": string(jsonBytes(map[string]any{"references": []any{"mcp__node_repl.js"}, "code": string(doubleEncoded)})),
 		}
 		_, response, changed, err := transformResponseBody(jsonBytes(map[string]any{"output": []any{native}}), source)
 		if err != nil || !changed {
-			t.Fatalf("double-encoded code should be recovered: changed=%t err=%v", changed, err)
+			t.Fatalf("double-encoded function payload should be recovered: changed=%t err=%v", changed, err)
 		}
 		call := objectValue(response["output"].([]any)[0])
 		if call["name"] != "js" || !strings.Contains(stringValue(call["arguments"]), "\"code\":\"ok\"") {
 			t.Fatalf("recovered call malformed: %#v", call)
+		}
+	})
+	t.Run("legacy_double_encoded_envelope_rejected", func(t *testing.T) {
+		source := namespaceTestSource("function", "js", "mcp__node_repl")
+		inner := string(jsonBytes(map[string]any{"tool": "mcp__node_repl.js", "args": map[string]any{"code": "ok"}}))
+		doubleEncoded, _ := json.Marshal(inner) // 整个旧封装再套一层 JSON 字符串转义
+		native := map[string]any{
+			"type": "function_call", "name": transportName, "id": "fc_z", "call_id": "call_z",
+			"arguments": string(jsonBytes(map[string]any{"code": string(doubleEncoded)})),
+		}
+		_, _, _, err := transformResponseBody(jsonBytes(map[string]any{"output": []any{native}}), source)
+		if !isKind(err, "invalid_tool_call") {
+			t.Fatalf("double-encoded legacy envelope must be rejected, got %v", err)
 		}
 	})
 }

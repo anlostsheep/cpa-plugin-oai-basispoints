@@ -351,22 +351,27 @@ type wsConnectResult struct {
 
 func (s *Service) executeStreamWS(request ExecutorRequest, body map[string]any, c credential) (any, error) {
 	cfg := s.config()
+	summary := request.relaySummary(s, TransportWS, true)
 	done, err := s.ensureLife(&request)
 	if err != nil {
+		summary.finish("", err)
 		return nil, err
 	}
 	runCtx := request.lifeCtx
 	source, parseErr := requestSource(request)
 	if parseErr != nil {
 		done()
+		summary.finish("prepare_error", parseErr)
 		return nil, parseErr
 	}
+	summary.setToolCallable(len(callableClientToolSpecs(source)) > 0)
 	// ctx 派生自插件这一代的生命周期：plugin.shutdown 以 errPluginStopped 取消它，往返
 	// 随即发送 cancel 帧并退出；心跳 emit 失败（客户端断开）也会 cancel 它。
 	ctx, cancel := context.WithTimeout(runCtx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	// 建连（拨号 + 首帧）在后台进行，按「延迟心跳」规则最多同步等待一个心跳间隔：
 	// 窗口内失败时下游无任何字节，同步返回带状态码的错误交给 CPA。
 	connected := make(chan wsConnectResult, 1)
+	summary.attemptStarted()
 	go func() {
 		turn, err := s.openWSTurn(ctx, body, c)
 		connected <- wsConnectResult{turn: turn, err: err}
@@ -375,13 +380,21 @@ func (s *Service) executeStreamWS(request ExecutorRequest, body map[string]any, 
 	if early != nil && early.err != nil {
 		cancel()
 		done()
+		summary.finish("connect_error", early.err)
 		return nil, early.err
 	}
 	session := s.newStreamSession(request.StreamID, cfg.heartbeatInterval(), cancel)
+	// 先挂汇总钩子，再启动会触发关流的看门狗。
+	summary.bind(session)
 	session.bindLifecycle(runCtx)
 	go func() {
 		defer done()
 		defer cancel()
+		failWith := func(exit string, err error) {
+			summary.setExit(exit)
+			session.fail(err)
+			summary.finishAfter(session, exit, err) // 正常已由关流钩子写出；这里兜底强关
+		}
 		session.start()
 		var turn *wsTurn
 		if early != nil {
@@ -389,7 +402,7 @@ func (s *Service) executeStreamWS(request ExecutorRequest, body map[string]any, 
 		} else {
 			late := <-connected
 			if late.err != nil {
-				session.fail(late.err)
+				failWith("connect_error", late.err)
 				return
 			}
 			turn = late.turn
@@ -397,25 +410,34 @@ func (s *Service) executeStreamWS(request ExecutorRequest, body map[string]any, 
 		for attempt := 0; ; attempt++ {
 			completed, err := turn.readUntilCompleted(ctx)
 			if err != nil {
-				session.fail(err)
+				failWith("", err)
 				return
 			}
-			_, transformed, _, transformErr := transformResponseBody(jsonBytes(completed), source)
+			_, transformed, _, stats, transformErr := transformResponseBodyStats(jsonBytes(completed), source)
+			summary.validated(stats, transformErr)
 			if transformErr == nil {
+				summary.setTerminalStatus(stringValue(transformed["status"]))
 				// finish 在持锁的最终输出边界再次检查本代是否已停止。
-				session.finish(transformed)
+				outcome := session.finish(transformed)
+				var outcomeErr error
+				if outcome == finishStopped {
+					outcomeErr = stoppedError()
+				}
+				summary.finishAfter(session, outcome, outcomeErr)
 				return
 			}
 			retry, ok := relayRetryBody(body, completed, transformErr, attempt)
 			if !ok {
-				session.fail(transformErr)
+				failWith("", transformErr)
 				return
 			}
 			s.logRegenerate(request, "ws", true, transformErr)
+			summary.regenerating()
 			// 重新生成一次：新连接、新 response.create，同一 ctx（断开/停止/总超时）约束。
 			body = retry
+			summary.attemptStarted()
 			if turn, err = s.openWSTurn(ctx, body, c); err != nil {
-				session.fail(err)
+				failWith("", err)
 				return
 			}
 		}
