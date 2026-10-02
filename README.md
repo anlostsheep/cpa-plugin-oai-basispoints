@@ -52,6 +52,7 @@ make build
 - `turn_id` 按会话和当前用户 turn 稳定生成；工具结果回合只递增 `agent_iteration`，不会把同一 turn 重新当成新计划。
 - 工具中继（0.1.17.0 起）：外层 `run_officejs` 的 `references` 恰好列出一个完整工具名，`code` 只放该工具的载荷且始终是字符串——function 为参数 JSON 对象的文本，custom 为原文（逐字保留，不做 JSON 解码）。插件只解析它，不执行其中内容。
 - 过渡期兼容：`references` 缺失或恰好为 `[]`，且 `code` 是合法的旧 `{"tool":…,"args":…}` 封装时，仍按旧路由接受（汇总里记为 `legacy`）；`references` 为其他任何值都严格按新格式处理。旧解析器的其他宽容（对象型 `code`、嵌套 `run_officejs`、对整个 `code` 再解码一层）不再接受；只有 function 参数恰好多套一层 JSON 字符串时允许解码一次。历史里的旧格式调用原样回放。
+- 用户消息图片（0.1.17.1 起）：data URL 先上传到附件接口，客户端已有的 `file_id` 直接引用，两者发往上游时都只带 `{"type":"input_image","file_id":…}`。Basis Points 的文件引用不接受 `detail` 等字段（带 `detail` 会返回 422），所以客户端指定的 `detail`（含 `high`、`original`）不会转发；这只是为了匹配上游接受的形状，不代表精度语义与公开 Responses API 相同。同一张图的 `file_id` 和 `image_url` 都是非空字符串时，插件会在任何上传或请求之前返回 400 `invalid_image`，并给出 `input[i].content[j]` 位置（空值或非字符串值视为未提供）。上传格式按字节识别为 PNG / JPEG / GIF / WebP，使用固定后缀与 MIME（声明须为 `image/*`；别名或与字节不符时以字节为准；无法识别时在上传前报错）。远程 URL 图片和工具结果里的图片不做上述处理。上游拒绝带图片的请求时，错误附 `image_refs`（最多 16 个位置与引用类别），上游文本改为安全摘要：只取 JSON 中的错误字段，解码后替换凭据和本次请求的图片引用，再把 data URL、http(s) 链接、`file-…` 形式的回显替换掉，最后截断到 300 字节；原文不是 JSON 时只给固定摘要。代价是这类错误里的普通文档链接也会被替换。
 - 工具调用失败的诊断区分「目录里有但本轮 `tool_choice` 不允许」（`tool_not_allowed_by_tool_choice`）与「未声明」（`tool_not_in_catalog`）；custom 调用的 item id 使用 `ctc_` 前缀。
 
 ## 中继汇总日志（0.1.17.0 起）

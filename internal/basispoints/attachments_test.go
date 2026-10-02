@@ -145,8 +145,9 @@ func TestInlineImageUploadWireContract(t *testing.T) {
 				if len(parts) != 2 || received["reasoning_effort"] != "xhigh" || received["stream"] != stream {
 					t.Fatal("request content or settings changed")
 				}
-				for i, detail := range []string{"high", "auto"} {
-					if !reflect.DeepEqual(objectValue(parts[i]), map[string]any{"type": "input_image", "file_id": "file-uploaded", "detail": detail}) {
+				// 0.1.17.1（#17）：文件引用只带 type 与 file_id，客户端的 detail（high / 缺省）都不再发送。
+				for i := range 2 {
+					if !reflect.DeepEqual(objectValue(parts[i]), map[string]any{"type": "input_image", "file_id": "file-uploaded"}) {
 						t.Fatal("incorrect image reference")
 					}
 				}
@@ -322,9 +323,26 @@ func TestImageUploadPreservesOtherInputKinds(t *testing.T) {
 	if err := service.uploadInputImages(ExecutorRequest{}, source, credential{}, defaultConfig()); err != nil {
 		t.Fatal(err)
 	}
-	if string(jsonBytes(source)) != before {
-		t.Fatal("modified existing ID, remote URL, or tool output")
+	// 已有 file_id 规范化为 {type, file_id}（#17），不上传；远程 URL、工具结果、助手消息原样保留。
+	content := objectValue(source["input"].([]any)[0])["content"].([]any)
+	if !reflect.DeepEqual(objectValue(content[0]), map[string]any{"type": "input_image", "file_id": "file-existing"}) {
+		t.Fatalf("existing file reference not normalized: %#v", content[0])
 	}
+	want := map[string]any{}
+	_ = json.Unmarshal([]byte(before), &want)
+	wantContent := objectValue(want["input"].([]any)[0])["content"].([]any)
+	if !reflect.DeepEqual(content[1], wantContent[1]) {
+		t.Fatal("modified remote URL")
+	}
+	if !reflect.DeepEqual(jsonRoundTrip(source["input"].([]any)[1:]), want["input"].([]any)[1:]) {
+		t.Fatal("modified tool output or assistant content")
+	}
+}
+
+func jsonRoundTrip(value any) any {
+	var out any
+	_ = json.Unmarshal(jsonBytes(value), &out)
+	return out
 }
 
 func TestAttachmentErrorsRedactCredentialsAndImageBytes(t *testing.T) {

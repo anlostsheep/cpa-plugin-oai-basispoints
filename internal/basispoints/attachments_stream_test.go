@@ -3,6 +3,7 @@ package basispoints
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -35,8 +36,8 @@ func TestUploadedImageCompletesStreamThroughHostJSON(t *testing.T) {
 				return err
 			}
 			part := objectValue(lastUserContent(body)[0])
-			if part["file_id"] != "file-stream-json" || part["image_url"] != nil {
-				return fmt.Errorf("stream request lost image reference")
+			if !reflect.DeepEqual(part, map[string]any{"type": "input_image", "file_id": "file-stream-json"}) {
+				return fmt.Errorf("stream request image reference must be exactly {type, file_id}: %#v", part)
 			}
 			result = map[string]any{"status_code": 200, "stream_id": "json-upstream", "headers": map[string][]string{"Content-Type": {"text/event-stream"}}}
 		case "host.http.stream_read":

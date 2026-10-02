@@ -2,11 +2,16 @@ package basispoints
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -49,8 +54,11 @@ func TestExecuteImageThroughLocalHTTP(t *testing.T) {
 				return
 			}
 			part := objectValue(lastUserContent(body)[0])
-			if part["file_id"] != "file-http-test" || part["image_url"] != nil || part["detail"] != "high" {
-				t.Error("HTTP response request lost the attachment reference or detail")
+			// 0.1.17.1（#17）：只发 {type, file_id}。夹具按 issue #17 的真实上游对照拒绝多余字段（422）。
+			if !reflect.DeepEqual(part, map[string]any{"type": "input_image", "file_id": "file-http-test"}) {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = io.WriteString(w, `{"message":"Invalid request body."}`)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp-local-test", "status": "completed", "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "local protocol fixture"}}}}})
 		default:
@@ -61,7 +69,20 @@ func TestExecuteImageThroughLocalHTTP(t *testing.T) {
 	defer server.Close()
 	service := NewService()
 	service.cfg.ResponsesURL = server.URL + "/api/responses"
-	service.SetHost(func(method string, payload any, out any) error {
+	setLocalImageHTTPHost(service, server)
+	request := imageRequest(map[string]any{"type": "input_image", "image_url": dataURL, "detail": "high"})
+	result, err := service.Handle("executor.execute", jsonBytes(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploads != 1 || responses != 1 || !strings.Contains(string(result.(map[string]any)["Payload"].([]byte)), "local protocol fixture") {
+		t.Fatal("local executor HTTP flow did not complete")
+	}
+}
+
+// setLocalImageHTTPHost 把宿主的 host.http.do 回调转发到本地 HTTP 夹具（模拟宿主真实 JSON 返回）。
+func setLocalImageHTTPHost(service *Service, server *httptest.Server) {
+	service.SetHost(opTolerant(func(method string, payload any, out any) error {
 		if method != "host.http.do" {
 			return fmt.Errorf("unexpected callback %s", method)
 		}
@@ -90,13 +111,102 @@ func TestExecuteImageThroughLocalHTTP(t *testing.T) {
 		}
 		// 模拟宿主真实 JSON 返回，而非跳过反序列化直接赋值。
 		return json.Unmarshal(jsonBytes(map[string]any{"StatusCode": response.StatusCode, "Headers": response.Header, "Body": data}), out)
-	})
-	request := imageRequest(map[string]any{"type": "input_image", "image_url": dataURL, "detail": "high"})
-	result, err := service.Handle("executor.execute", jsonBytes(request))
-	if err != nil {
+	}))
+}
+
+// 服务端夹具只按 issue #15 报告的后缀白名单校验，不代表真实上游的现场复现。fork 适配：不构造
+// Payload 与 OriginalRequest 的来源分歧（fork 优先 OriginalRequest），只保留九图、两轮历史回放
+// 与缓存复用的验收。
+func TestNineImageHistoryUsesSupportedUploadedFilenames(t *testing.T) {
+	dataURL, pngData := testImageDataURL(t)
+	var jpegData bytes.Buffer
+	if err := jpeg.Encode(&jpegData, image.NewRGBA(image.Rect(0, 0, 3, 2)), nil); err != nil {
 		t.Fatal(err)
 	}
-	if uploads != 1 || responses != 1 || !strings.Contains(string(result.(map[string]any)["Payload"].([]byte)), "local protocol fixture") {
-		t.Fatal("local executor HTTP flow did not complete")
+	files := map[string]string{}
+	responses := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/attachments":
+			reader, err := r.MultipartReader()
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			part, err := reader.NextPart()
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			data, err := io.ReadAll(part)
+			if err != nil || (!bytes.Equal(data, pngData) && !bytes.Equal(data, jpegData.Bytes())) {
+				t.Error("uploaded image bytes changed")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			fileID := fmt.Sprintf("file-local-%d", len(files))
+			files[fileID] = part.FileName()
+			_ = json.NewEncoder(w).Encode(map[string]any{"openai_file_id": fileID})
+		case "/api/responses":
+			responses++
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			parts := lastUserContent(body)
+			if len(parts) != 9 {
+				t.Error("image history was dropped")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			for _, value := range parts {
+				filename, exists := files[stringValue(objectValue(value)["file_id"])]
+				if !exists {
+					t.Error("response references a file that was not uploaded")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				switch extension := path.Ext(filename); extension {
+				case ".jpeg", ".jpg", ".png", ".gif", ".webp":
+				default:
+					if extension == "" {
+						extension = "none"
+					}
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]any{"message": "Invalid input: Expected image type to be a supported format: .jpeg, .jpg, .png, .gif, .webp but got " + extension})
+					return
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp-nine-images", "status": "completed", "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "nine-image fixture"}}}}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	service := NewService()
+	service.cfg.ResponsesURL = server.URL + "/api/responses"
+	setLocalImageHTTPHost(service, server)
+	var parts []any
+	for i := 0; i < 8; i++ {
+		parts = append(parts, map[string]any{"type": "input_image", "image_url": dataURL})
+	}
+	parts = append(parts, map[string]any{"type": "input_image", "image_url": "data:image/jpg;base64," + base64.StdEncoding.EncodeToString(jpegData.Bytes())})
+	request := imageRequest(parts...)
+	for i := 0; i < 2; i++ {
+		result, err := service.Handle("executor.execute", jsonBytes(request))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(result.(map[string]any)["Payload"].([]byte)), "nine-image fixture") {
+			t.Fatal("nine-image HTTP fixture did not complete")
+		}
+	}
+	if len(files) != 2 || responses != 2 {
+		t.Fatalf("uploads=%d responses=%d; expected cache reuse across history replay", len(files), responses)
 	}
 }

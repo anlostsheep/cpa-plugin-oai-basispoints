@@ -2,9 +2,12 @@ package basispoints
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -342,27 +345,153 @@ func (d *sseDecoder) feed(chunk []byte, emit func(event, data string) error) err
 	}
 }
 
-// 仅附加非敏感摘要，不记录对话正文、图片内容或认证信息。
-func upstreamRequestError(status int, raw []byte, body map[string]any, c credential) error {
-	redacted := string(raw)
-	for _, secret := range []string{c.AccessToken, c.AccountID, c.Email} {
-		if secret != "" {
-			redacted = strings.ReplaceAll(redacted, secret, "[REDACTED]")
-		}
+// imageRefPattern 匹配上游错误文本里可能回显的图片引用：data URL、http(s) URL、file-… 形式的文件 ID。
+var imageRefPattern = regexp.MustCompile(`(?i)data:[^\s"'<>]*|https?://[^\s"'<>]+|\bfile-[A-Za-z0-9_-]{4,}`)
+
+// maxImageErrorMessage 是图片请求错误摘要中上游文本的上限（字节，脱敏之后再截断）。
+const maxImageErrorMessage = 300
+
+// safeDetailEntry 只接受类型正确的校验错误条目：msg 为非空字符串，type 缺省或为字符串，loc 缺省
+// 或为只含字符串 / 数字的数组。嵌套对象等其他形态一律丢弃，不进入摘要。
+func safeDetailEntry(entry map[string]any) (map[string]any, bool) {
+	if entry == nil {
+		return nil, false
 	}
-	message := redactTokenMessage(errorMessage([]byte(redacted)))
-	images, originalDetails := 0, 0
-	items, _ := body["input"].([]any)
-	for _, value := range items {
-		parts, _ := objectValue(value)["content"].([]any)
-		for _, part := range parts {
-			if stringValue(objectValue(part)["type"]) == "input_image" {
-				images++
-				if stringValue(objectValue(part)["detail"]) == "original" {
-					originalDetails++
-				}
+	msg, ok := entry["msg"].(string)
+	if !ok || strings.TrimSpace(msg) == "" {
+		return nil, false
+	}
+	safe := map[string]any{"msg": msg}
+	if value, present := entry["type"]; present && value != nil {
+		kind, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		safe["type"] = kind
+	}
+	if value, present := entry["loc"]; present && value != nil {
+		list, ok := value.([]any)
+		if !ok {
+			return nil, false
+		}
+		for _, item := range list {
+			switch item.(type) {
+			case string, float64, json.Number:
+			default:
+				return nil, false
 			}
 		}
+		safe["loc"] = list
+	}
+	return safe, true
+}
+
+// jsonErrorField 从已解析的上游错误对象里只取允许的错误字段（与 errorMessage 的 JSON 规则一致：
+// detail 列表只保留 loc / msg / type，其次 detail 字符串、error.message、message、error 字符串）。
+// 没有可用字段、字段为空或类型不符时返回 ok=false——调用方不得退回原文。
+func jsonErrorField(object map[string]any) (string, bool) {
+	if details, ok := object["detail"].([]any); ok && len(details) > 0 {
+		safe := make([]map[string]any, 0, len(details))
+		for _, value := range details {
+			if entry, ok := safeDetailEntry(objectValue(value)); ok {
+				safe = append(safe, entry)
+			}
+		}
+		if len(safe) > 0 {
+			return string(jsonBytes(map[string]any{"detail": safe})), true
+		}
+	}
+	candidates := []any{object["detail"], objectValue(object["error"])["message"], object["message"], object["error"]}
+	for _, candidate := range candidates {
+		if text, ok := candidate.(string); ok && strings.TrimSpace(text) != "" {
+			return text, true
+		}
+	}
+	return "", false
+}
+
+// imageErrorSummary 生成图片请求错误的安全摘要：只用 jsonErrorField 从解析后的对象里取允许的
+// 错误字段，不对原文做任何字符串改写，也不调用会退回原文的 errorMessage；原文不是 JSON、或没有
+// 可用的错误字段时，只给固定摘要。提取出的文本在解码之后脱敏：凭据精确替换，
+// 本次请求的图片引用按长度降序替换（短值不跳过，避免长值被前缀替换后泄露后缀），再用模式兜底
+// 替换 data: / http(s):// / file-… 形式的回显；最后才截断。代价是图片请求错误里的普通链接也会被
+// 替换。
+func imageErrorSummary(raw []byte, c credential, secrets []string) string {
+	var object map[string]any
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return fmt.Sprintf("non-JSON error body (%d bytes)", len(raw))
+	}
+	message, ok := jsonErrorField(object)
+	if !ok {
+		return "error body without a message"
+	}
+	ordered := make([]string, 0, len(secrets)+3)
+	for _, secret := range append([]string{c.AccessToken, c.AccountID, c.Email}, secrets...) {
+		if secret != "" {
+			ordered = append(ordered, secret)
+		}
+	}
+	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+	for _, secret := range ordered {
+		message = strings.ReplaceAll(message, secret, "[REDACTED]")
+	}
+	message = imageRefPattern.ReplaceAllString(message, "[REDACTED_IMAGE]")
+	message = redactTokenMessage(message)
+	if len(message) > maxImageErrorMessage {
+		message = strings.ToValidUTF8(message[:maxImageErrorMessage], "") + "…"
+	}
+	return message
+}
+
+// 仅附加非敏感摘要，不记录对话正文、图片内容或认证信息。图片请求的错误另附 image_refs（只有
+// 位置与引用类别，移植自上游 08e349c），上游文本改用 imageErrorSummary 的安全摘要。
+func upstreamRequestError(status int, raw []byte, body map[string]any, c credential) error {
+	images, originalDetails := 0, 0
+	var imageRefs, imageSecrets []string
+	items, _ := body["input"].([]any)
+	for i, value := range items {
+		parts, _ := objectValue(value)["content"].([]any)
+		for j, value := range parts {
+			part := objectValue(value)
+			if stringValue(part["type"]) != "input_image" {
+				continue
+			}
+			images++
+			if stringValue(part["detail"]) == "original" {
+				originalDetails++
+			}
+			kind := "missing"
+			if fileID := stringValue(part["file_id"]); fileID != "" {
+				kind = "file_id"
+				imageSecrets = append(imageSecrets, fileID)
+			} else if imageURL := stringValue(part["image_url"]); imageURL != "" {
+				kind = "image_url"
+				imageSecrets = append(imageSecrets, imageURL)
+				if len(imageURL) >= 5 && strings.EqualFold(imageURL[:5], "data:") {
+					kind = "data_url"
+					if _, payload, found := strings.Cut(imageURL, ","); found {
+						imageSecrets = append(imageSecrets, payload)
+					}
+				}
+			}
+			// 只输出发往上游的请求中的索引和引用类别，不输出 URL、文件 ID 或图片内容。
+			if len(imageRefs) < 16 {
+				imageRefs = append(imageRefs, fmt.Sprintf("input[%d].content[%d]:%s", i, j, kind))
+			}
+		}
+	}
+	var message string
+	if images > 0 {
+		message = imageErrorSummary(raw, c, imageSecrets)
+	} else {
+		// 不带图片的请求保持原有处理。
+		redacted := string(raw)
+		for _, secret := range []string{c.AccessToken, c.AccountID, c.Email} {
+			if secret != "" {
+				redacted = strings.ReplaceAll(redacted, secret, "[REDACTED]")
+			}
+		}
+		message = redactTokenMessage(errorMessage([]byte(redacted)))
 	}
 	tier := "unspecified"
 	if value, exists := body["service_tier"]; exists {
@@ -373,5 +502,12 @@ func upstreamRequestError(status int, raw []byte, body map[string]any, c credent
 			tier = "invalid"
 		}
 	}
-	return fail(status, "upstream_error", fmt.Sprintf("Basis Points HTTP %d: %s (reasoning_effort=%s; service_tier=%s; input_images=%d; original_detail_images=%d)", status, message, stringValue(body["reasoning_effort"]), tier, images, originalDetails))
+	imageSummary := ""
+	if images > 0 {
+		imageSummary = "; image_refs=" + strings.Join(imageRefs, ",")
+		if images > len(imageRefs) {
+			imageSummary += fmt.Sprintf(",...(%d more)", images-len(imageRefs))
+		}
+	}
+	return fail(status, "upstream_error", fmt.Sprintf("Basis Points HTTP %d: %s (reasoning_effort=%s; service_tier=%s; input_images=%d; original_detail_images=%d%s)", status, message, stringValue(body["reasoning_effort"]), tier, images, originalDetails, imageSummary))
 }
