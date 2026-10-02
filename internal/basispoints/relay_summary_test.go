@@ -140,6 +140,114 @@ func TestRelaySummaryHTTPStreamInvalidAfterText(t *testing.T) {
 	}
 }
 
+// 只交付了推理摘要（无正文）：text_committed 保持 false（正文口径），summary_committed 为 true。
+func TestRelaySummarySummaryOnlyDelivery(t *testing.T) {
+	s := newBPStream("resp_sum_only")
+	s.reasoning("只有摘要。", 3)
+	h := newIncHost(chunks(s.terminal(), 3))
+	startIncremental(t, h, 5, relaySource())
+	h.waitClosed(t)
+	rec := h.waitSummary(t)
+	if rec.TextCommitted || !rec.SummaryCommitted {
+		t.Fatalf("summary-only delivery flags wrong: %+v", rec)
+	}
+	if rec.Delivery != "incremental" || rec.Exit != "completed" || rec.First != relayNoCall || rec.Final != relayNoCall {
+		t.Fatalf("summary-only summary wrong: %+v", rec)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if got := streamedSummary(events); got != "只有摘要。" {
+		t.Fatalf("summary %q", got)
+	}
+	assertNoContent(t, h, "只有摘要")
+}
+
+// 摘要已交付后工具无效：不重生成，summary_committed 为 true、final 保留 invalid。
+func TestRelaySummarySummaryCommittedThenInvalidToolFails(t *testing.T) {
+	bad, _ := relayFixture("call_sum_only_bad", true)
+	s := newBPStream("resp_sum_only_bad")
+	s.reasoning("先交付摘要。", 3)
+	s.tool(bad, 3)
+	h := newIncHost(chunks(s.terminal(), 5))
+	startIncremental(t, h, 5, relaySource())
+	h.waitClosed(t)
+	rec := h.waitSummary(t)
+	if !rec.SummaryCommitted || rec.TextCommitted {
+		t.Fatalf("summary-only delivery flags wrong: %+v", rec)
+	}
+	if rec.Attempts != 1 || rec.Regen != regenNone || rec.Exit != "failed" || rec.ErrorKind != "invalid_tool_call" || !strings.HasPrefix(rec.Final, "invalid:") {
+		t.Fatalf("after-summary failure summary wrong: %+v", rec)
+	}
+	assertNoContent(t, h, "先交付摘要", "Begin Patch", "call_sum_only_bad")
+}
+
+// 正文与摘要都提前交付：两个口径同时为 true，且交付后失败不重生成。
+func TestRelaySummaryBothTextAndSummaryCommitted(t *testing.T) {
+	good, _ := relayFixture("call_sum_both", false)
+	s := newBPStream("resp_sum_both")
+	s.reasoning("摘要先到。", 2)
+	s.message("正文随后。", 3)
+	s.tool(good, 2)
+	h := newIncHost(chunks(s.terminal(), 4))
+	startIncremental(t, h, 5, relaySource())
+	h.waitClosed(t)
+	rec := h.waitSummary(t)
+	if !rec.TextCommitted || !rec.SummaryCommitted {
+		t.Fatalf("both delivery flags must be set: %+v", rec)
+	}
+	if rec.Delivery != "incremental" || rec.Exit != "completed" || rec.Attempts != 1 || rec.Regen != regenNone {
+		t.Fatalf("summary wrong: %+v", rec)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if streamedSummary(events) != "摘要先到。" || streamedText(events) != "正文随后。" {
+		t.Fatalf("delivery content wrong: summary=%q text=%q", streamedSummary(events), streamedText(events))
+	}
+	assertNoContent(t, h, "摘要先到", "正文随后", "Begin Patch")
+}
+
+// 纯正文（无推理条目）：summary_committed 保持 false。
+func TestRelaySummaryTextOnlyLeavesSummaryFlagFalse(t *testing.T) {
+	good, _ := relayFixture("call_sum_textonly", false)
+	s := newBPStream("resp_sum_textonly")
+	s.message("只交付正文。", 3)
+	s.tool(good, 2)
+	h := newIncHost(chunks(s.terminal(), 3))
+	startIncremental(t, h, 5, relaySource())
+	h.waitClosed(t)
+	rec := h.waitSummary(t)
+	if !rec.TextCommitted || rec.SummaryCommitted {
+		t.Fatalf("text-only delivery flags wrong: %+v", rec)
+	}
+}
+
+// HTTP 增量但整轮未提交（上游没有 response.created，meta 缺失）：终态整体回放，
+// 两个交付口径都保持 false，客户端看不到摘要增量事件。
+func TestRelaySummaryUncommittedReplayLeavesFlagsFalse(t *testing.T) {
+	s := newBPStream("resp_sum_uncommitted")
+	s.reasoning("终态才交付的摘要。", 3)
+	s.message("终态才交付的正文。", 4)
+	var blocks []string
+	for _, b := range s.terminal() {
+		if strings.HasPrefix(b, "event: response.created\n") || strings.HasPrefix(b, "event: response.in_progress\n") {
+			continue
+		}
+		blocks = append(blocks, b)
+	}
+	h := newIncHost(chunks(blocks, 5))
+	startIncremental(t, h, 5, relaySource())
+	h.waitClosed(t)
+	rec := h.waitSummary(t)
+	if rec.TextCommitted || rec.SummaryCommitted {
+		t.Fatalf("uncommitted replay must leave both flags false: %+v", rec)
+	}
+	if rec.Delivery != "incremental" || rec.Exit != "completed" {
+		t.Fatalf("summary wrong: %+v", rec)
+	}
+	raw := h.snapshot()
+	if strings.Contains(raw, "response.reasoning_summary_text.delta") || !strings.Contains(raw, "终态才交付的摘要。") {
+		t.Fatal("uncommitted replay must deliver the summary only in the full item")
+	}
+}
+
 func TestRelaySummaryHTTPStreamNoToolsNoCall(t *testing.T) {
 	s := newBPStream("resp_sum_text")
 	s.message("纯文本。", 3)
@@ -252,7 +360,7 @@ func TestRelaySummaryNonStream(t *testing.T) {
 		t.Fatalf("want one summary, got %+v", recs)
 	}
 	rec := recs[0]
-	if rec.Stream || rec.Delivery != "non_stream" || rec.Attempts != 2 || rec.First != "invalid:invalid_json" || rec.Final != relayLegacy || rec.Regen != regenSuccess || rec.Exit != "completed" || rec.LegacyCalls != 1 {
+	if rec.Stream || rec.Delivery != "non_stream" || rec.Attempts != 2 || rec.First != "invalid:invalid_json" || rec.Final != relayLegacy || rec.Regen != regenSuccess || rec.Exit != "completed" || rec.LegacyCalls != 1 || rec.TextCommitted || rec.SummaryCommitted {
 		t.Fatalf("non-stream summary wrong: %+v", rec)
 	}
 }
@@ -399,7 +507,7 @@ func TestRelaySummaryWS(t *testing.T) {
 			recs = append(recs, rec)
 		}
 	}
-	if len(recs) != 1 || recs[0].Transport != TransportWS || recs[0].Delivery != "terminal" || recs[0].Final != relayLegacy || recs[0].Exit != "completed" || recs[0].Attempts != 1 {
+	if len(recs) != 1 || recs[0].Transport != TransportWS || recs[0].Delivery != "terminal" || recs[0].Final != relayLegacy || recs[0].Exit != "completed" || recs[0].Attempts != 1 || recs[0].TextCommitted || recs[0].SummaryCommitted {
 		t.Fatalf("ws summary wrong: %+v", recs)
 	}
 }

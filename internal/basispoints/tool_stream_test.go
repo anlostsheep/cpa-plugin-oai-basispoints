@@ -201,8 +201,20 @@ func TestExecutorNativeToolRoundTrip(t *testing.T) {
 						t.Fatal(err)
 					}
 					history := prepared["input"].([]any)
-					if !reflect.DeepEqual(history[len(history)-2], native) || !reflect.DeepEqual(objectValue(history[len(history)-1])["output"], image) {
-						t.Fatalf("next request lost native identity or image result: %#v", history[len(history)-2:])
+					replayedCall := objectValue(history[len(history)-2])
+					want := string(jsonBytes(args))
+					if toolType == "custom" {
+						want = args.(string)
+					}
+					if route, code := rebuiltRoute(t, replayedCall); route != "mcp__node_repl.js" || code != want {
+						t.Fatalf("next request lost native identity: route=%q code=%q", route, code)
+					}
+					if replayedCall["call_id"] != call["call_id"] || replayedCall["id"] != functionItemID(stringValue(call["call_id"])) {
+						t.Fatalf("next request lost the call identity: %#v", replayedCall)
+					}
+					replayedOutput := objectValue(history[len(history)-1])
+					if replayedOutput["type"] != "function_call_output" || replayedOutput["call_id"] != call["call_id"] || !reflect.DeepEqual(replayedOutput["output"], image) {
+						t.Fatalf("next request lost image result: %#v", history[len(history)-1])
 					}
 				})
 			}

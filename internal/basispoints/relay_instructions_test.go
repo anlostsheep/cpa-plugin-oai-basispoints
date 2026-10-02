@@ -107,7 +107,10 @@ func TestFunctionRelayComplexTextRoundTrip(t *testing.T) {
 			if reason != "" || streamed[field] != payload {
 				t.Fatal("streaming changed quotes, escapes or whitespace")
 			}
-			replay := translateInputItems([]any{call})
+			replay, replayErr := translateInputItems([]any{call})
+			if replayErr != nil {
+				t.Fatal(replayErr)
+			}
 			replayed, err := extractNativeClientToolCall(objectValue(replay[0]), clientToolSpecs(source))
 			if err != nil || replayed["arguments"] != call["arguments"] {
 				t.Fatal("history replay changed the function payload")

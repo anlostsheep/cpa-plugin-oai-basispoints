@@ -537,9 +537,10 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 		}
 		for attempt := 0; ; attempt++ {
 			// 每次往返一台新的增量交付状态机；客户端 response id 由会话固定，不随重新生成改变。
-			// 正文 commit 的那一刻就记下 text_committed（看门狗可能在读取结束前强制关流）。
-			delivery := newStreamDelivery(session.open, func(meta map[string]any, frames []map[string]any) error {
-				summary.markTextCommitted()
+			// 正文/摘要 commit 的那一刻就记下交付口径（看门狗可能在读取结束前强制关流）。
+			var delivery *streamDelivery
+			delivery = newStreamDelivery(session.open, func(meta map[string]any, frames []map[string]any) error {
+				summary.markDelivery(delivery.deliveredText, delivery.deliveredSummary)
 				return session.deliver(meta, frames)
 			})
 			delivery.bufferUntilValidated = buffered
@@ -552,7 +553,7 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				readErr = feeder.flush()
 			}
 			if delivery.committed {
-				summary.markTextCommitted()
+				summary.markDelivery(delivery.deliveredText, delivery.deliveredSummary)
 			}
 			if readErr != nil {
 				failWith("", readErr)
@@ -563,7 +564,8 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				failWith("", parseErr)
 				return
 			}
-			// 先核对终态与已交付（或缓冲校验）的正文一致，再做工具整批转换（转换会写入历史身份缓存）。
+			// 先核对终态与已交付（或缓冲校验）的正文/摘要一致，再做工具整批转换（历史按条目
+			// 冷重建，不依赖也不写入本次转换的进程内状态）。
 			if err := delivery.validateFinal(response); err != nil {
 				failWith("", err)
 				return
@@ -579,10 +581,11 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 			if transformErr == nil {
 				summary.setTerminalStatus(stringValue(transformedResponse["status"]))
 				// finish 在持锁的最终输出边界再次检查本代是否已停止；已 commit 时只补发未交付部分。
-				// keepFinal 只用于增量交付且正文已 commit 的情形；buffered 一律完整回放。
+				// finishIncremental（带摘要增量的终态回放 + keepFinal）只用于增量交付且已 commit 的
+				// 情形；buffered 与未提交一律完整回放（legacy 形状）。
 				var outcome string
 				if delivery.committed {
-					outcome = session.finishWith(transformedResponse, delivery.keepFinal)
+					outcome = session.finishIncremental(transformedResponse, delivery.keepFinal)
 				} else {
 					outcome = session.finish(transformedResponse)
 				}
@@ -594,8 +597,8 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, cr
 				return
 			}
 			if delivery.committed {
-				// 正文已交付给客户端：不能重新生成（会重复输出），直接以请求级失败结束。
-				s.logEvent(request, "warn", "basispoints: tool call invalid after text was delivered; not regenerating", map[string]any{
+				// 正文/摘要已交付给客户端：不能重新生成（会重复输出），直接以请求级失败结束。
+				s.logEvent(request, "warn", "basispoints: tool call invalid after output was delivered; not regenerating", map[string]any{
 					"transport": "http", "kind": errorKind(transformErr),
 				})
 				failWith("", transformErr)

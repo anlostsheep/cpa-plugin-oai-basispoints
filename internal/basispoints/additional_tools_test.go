@@ -2,7 +2,6 @@ package basispoints
 
 import (
 	"errors"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -54,9 +53,15 @@ func TestCodexAdditionalToolsCatalogCallAndReplay(t *testing.T) {
 		t.Fatalf("Codex client tool identity changed: %#v", call)
 	}
 	result := map[string]any{"type": "custom_tool_call_output", "call_id": call["call_id"], "output": "directory listing"}
-	replay := translateInputItems([]any{call, result})
-	if !reflect.DeepEqual(replay[0], native) || objectValue(replay[1])["type"] != "function_call_output" || objectValue(replay[1])["output"] != result["output"] {
-		t.Fatalf("native call or output replay changed: %#v", replay)
+	replay, err := translateInputItems([]any{call, result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route, code := rebuiltRoute(t, objectValue(replay[0])); route != "functions.exec" || code != "pwd" {
+		t.Fatalf("cold rebuild changed the Codex call: route=%q code=%q", route, code)
+	}
+	if replayed := objectValue(replay[1]); replayed["type"] != "function_call_output" || replayed["output"] != result["output"] || replayed["call_id"] != call["call_id"] {
+		t.Fatalf("output replay changed: %#v", replay[1])
 	}
 }
 

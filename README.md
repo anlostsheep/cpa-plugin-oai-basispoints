@@ -32,7 +32,7 @@ plugins:
 3. 在插件配置 `dedicated_auth_files` 中列出要使用 Basis Points 的 `type: codex` OAuth 文件名（auth-dir 内的裸文件名）。只有列出的文件会被插件接管；插件只在内存中读取 token，不生成另一份 token 文件。列出的文件需配套外部刷新脚本（见下文）。
 4. 客户端使用 Responses 协议调用 `gpt-6-astra-basispoints`。模型目录声明图像输入，以及 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 思考等级；`max` 映射为 `xhigh`，`ultra` 原样传递，未指定时默认 `medium`。
 
-插件的 `auth.parse` 只接管 `dedicated_auth_files` 中列出的 `type: codex` OAuth 文件，并以「共享模式」展开两条内存认证：一条保留原生 `codex`（现有 Codex 模型继续使用 CPA 原生执行器），另一条是 `oai-basispoints` 虚拟认证。两条记录都**不携带 refresh_token**，因此 CPA 不会轮换该凭据（**前提：CPA 未以 Home 控制面模式运行**，即启动参数没有 `-home-jwt`；Home 刷新不依赖 refresh_token，启用 Home 时不要使用本模式）；刷新由外部脚本独占完成（fork 仓库配套 `cpa-codex-token-refresh`），脚本原子改写文件后，CPA 重新加载，两条记录同时拿到新的 access token。两条记录都由 CPA 标为 `plugin_virtual`，CPA 不会把它们写回 OAuth 文件；只有虚拟记录额外标记 `runtime_only`，native 记录保持可在面板上刷新额度、重置额度。未列出的 codex 文件插件不接管，由 CPA 原生加载、刷新并写回，也不提供 Basis Points 模型。之所以这样设计：CPA 会把插件展开出的多条记录都标记为虚拟认证、不持久化刷新结果，若由 CPA 刷新，新的 refresh_token 只留在内存，文件中的旧值随即作废，重启后凭据失效。流式响应遵循 Responses SSE 格式：http 传输下 message 正文边读边转发（逐段增量）；工具调用需在完整 item 上做安全转换，与推理、推理摘要一起在终态整批回放；ws 传输仍先读完上游再回放。`heartbeat_seconds: 0` 只关闭心跳，不影响正文增量。
+插件的 `auth.parse` 只接管 `dedicated_auth_files` 中列出的 `type: codex` OAuth 文件，并以「共享模式」展开两条内存认证：一条保留原生 `codex`（现有 Codex 模型继续使用 CPA 原生执行器），另一条是 `oai-basispoints` 虚拟认证。两条记录都**不携带 refresh_token**，因此 CPA 不会轮换该凭据（**前提：CPA 未以 Home 控制面模式运行**，即启动参数没有 `-home-jwt`；Home 刷新不依赖 refresh_token，启用 Home 时不要使用本模式）；刷新由外部脚本独占完成（fork 仓库配套 `cpa-codex-token-refresh`），脚本原子改写文件后，CPA 重新加载，两条记录同时拿到新的 access token。两条记录都由 CPA 标为 `plugin_virtual`，CPA 不会把它们写回 OAuth 文件；只有虚拟记录额外标记 `runtime_only`，native 记录保持可在面板上刷新额度、重置额度。未列出的 codex 文件插件不接管，由 CPA 原生加载、刷新并写回，也不提供 Basis Points 模型。之所以这样设计：CPA 会把插件展开出的多条记录都标记为虚拟认证、不持久化刷新结果，若由 CPA 刷新，新的 refresh_token 只留在内存，文件中的旧值随即作废，重启后凭据失效。流式响应遵循 Responses SSE 格式：http 传输下 message 正文与推理摘要边读边转发（逐段增量）；工具调用需在完整 item 上做安全转换，随终态整批回放；推理 item 的开场事件原样携带上游已给出的字段（含非空 `encrypted_content`），终态必须与已交付的密文一致，缺失或为空时由终态补全；已交付的正文与摘要不重复回放；ws 传输仍先读完上游再回放。`heartbeat_seconds: 0` 只关闭心跳，不影响正文与摘要增量。
 
 ## 构建
 
@@ -47,11 +47,11 @@ make build
 
 ## 协议边界
 
-- http 流式下 message 正文边读边转发；工具调用、推理与推理摘要在终态整批给出，终态须与已转发正文一致。`stream_tool_mode: buffered`（默认 `incremental`）时，本轮有可调用工具的回合改为整轮校验通过后再交付：失败的那次不交付，交付前仍可重新生成一次，代价是这些回合看不到逐字输出；无工具或 `tool_choice: none` 的回合不受影响，非流式与 ws 传输不受影响。
+- http 流式下 message 正文与推理摘要（`reasoning_summary_*`）边读边转发；工具调用（名称与参数）只在终态整批给出；推理 item 的开场事件原样交付上游已给出的非空密文，终态必须与之一致，缺失或为空时由终态补全；终态须与已交付内容一致，已交付的正文与摘要不重复回放、只补发未交付的后缀与生命周期事件，不一致以请求级 `invalid_upstream_stream` 失败。摘要/正文的任一首次交付后不再重新生成（工具格式错误直接 `response.failed`）。未满足上游事件顺序前提（如缺 `response.created`、缺 item/part 开场事件，或提交批内乱序、重复）时，在尚未交付任何内容前整体退回终态回放（有正文却未能增量交付时另写一条计数日志）；已交付后到达的同类冲突仍以 `invalid_upstream_stream` 失败。`stream_tool_mode: buffered`（默认 `incremental`）时，本轮有可调用工具的回合改为整轮校验通过后再交付（正文与摘要都不提前发）：失败的那次不交付，交付前仍可重新生成一次，代价是这些回合看不到逐字输出；无工具或 `tool_choice: none` 的回合不受影响，非流式与 ws 传输不受影响。
 - 上游请求始终带 `Authorization: Bearer <access_token>`、`chatgpt-account-id`、`x-openai-account-id` 和 `x-basispoints-auth-mode: chatgpt`。
 - `turn_id` 按会话和当前用户 turn 稳定生成；工具结果回合只递增 `agent_iteration`，不会把同一 turn 重新当成新计划。
 - 工具中继（0.1.17.0 起）：外层 `run_officejs` 的 `references` 恰好列出一个完整工具名，`code` 只放该工具的载荷且始终是字符串——function 为参数 JSON 对象的文本，custom 为原文（逐字保留，不做 JSON 解码）。插件只解析它，不执行其中内容。
-- 过渡期兼容：`references` 缺失或恰好为 `[]`，且 `code` 是合法的旧 `{"tool":…,"args":…}` 封装时，仍按旧路由接受（汇总里记为 `legacy`）；`references` 为其他任何值都严格按新格式处理。旧解析器的其他宽容（对象型 `code`、嵌套 `run_officejs`、对整个 `code` 再解码一层）不再接受；只有 function 参数恰好多套一层 JSON 字符串时允许解码一次。历史里的旧格式调用原样回放。
+- 过渡期兼容：`references` 缺失或恰好为 `[]`，且 `code` 是合法的旧 `{"tool":…,"args":…}` 封装时，仍按旧路由接受（汇总里记为 `legacy`）；`references` 为其他任何值都严格按新格式处理。旧解析器的其他宽容（对象型 `code`、嵌套 `run_officejs`、对整个 `code` 再解码一层）不再接受；只有 function 参数恰好多套一层 JSON 字符串时允许解码一次。客户端历史里的 function / custom 调用按条目自身冷重建为新中继格式：字符串载荷逐字保留（custom 原文不解码）、对象参数保留原始数字（不经过浮点往返），不依赖当前工具目录或进程内缓存；直接提交的 native 传输调用按原文保留。
 - 用户消息图片（0.1.17.1 起）：data URL 先上传到附件接口，客户端已有的 `file_id` 直接引用，两者发往上游时都只带 `{"type":"input_image","file_id":…}`。Basis Points 的文件引用不接受 `detail` 等字段（带 `detail` 会返回 422），所以客户端指定的 `detail`（含 `high`、`original`）不会转发；这只是为了匹配上游接受的形状，不代表精度语义与公开 Responses API 相同。同一张图的 `file_id` 和 `image_url` 都是非空字符串时，插件会在任何上传或请求之前返回 400 `invalid_image`，并给出 `input[i].content[j]` 位置（空值或非字符串值视为未提供）。上传格式按字节识别为 PNG / JPEG / GIF / WebP，使用固定后缀与 MIME（声明须为 `image/*`；别名或与字节不符时以字节为准；无法识别时在上传前报错）。远程 URL 图片和工具结果里的图片不做上述处理。上游拒绝带图片的请求时，错误附 `image_refs`（最多 16 个位置与引用类别），上游文本改为安全摘要：只取 JSON 中的错误字段，解码后替换凭据和本次请求的图片引用，再把 data URL、http(s) 链接、`file-…` 形式的回显替换掉，最后截断到 300 字节；原文不是 JSON 时只给固定摘要。代价是这类错误里的普通文档链接也会被替换。
 - 工具调用失败的诊断区分「目录里有但本轮 `tool_choice` 不允许」（`tool_not_allowed_by_tool_choice`）与「未声明」（`tool_not_in_catalog`）；custom 调用的 item id 使用 `ctc_` 前缀。
 
@@ -66,7 +66,8 @@ make build
 | `config_mode`、`delivery` | 配置的 `stream_tool_mode`；实际交付方式 `incremental` / `buffered` / `terminal`（ws）/ `non_stream` |
 | `tool_callable` | 本轮是否有可调用的客户端工具；请求无法解析时为 `null` |
 | `attempts_started` | 发起的上游往返次数（首次 + 重新生成） |
-| `text_committed` | 工具校验前正文是否已进入提交 / 交付边界（插件开始把正文交给宿主流；不证明客户端已收到） |
+| `text_committed` | 工具校验前正文（`output_text`）是否已进入提交 / 交付边界（插件开始把正文交给宿主流；不证明客户端已收到） |
+| `summary_committed` | 工具校验前推理摘要（`reasoning_summary_text`）是否已进入提交 / 交付边界（口径同 `text_committed`，与正文各自独立；buffered、未提交回放、ws 与非流式均为 `false`） |
 | `first`、`final` | 本次执行内第一次有效的工具校验结果 / 最后一次尝试的工具校验结果：`not_run`、`no_call`、`ok`、`legacy`、`invalid:<原因>`。重新生成开始时 `final` 重置为 `not_run`，所以重新生成那次因上游错误中止时 `final` 是 `not_run`，不会残留第一次的 `invalid` |
 | `regen` | 重新生成结局：`none`、`success`、`exhausted`（重新生成后仍失败）、`aborted`（重新生成后未走到校验） |
 | `legacy_calls` | 按旧封装接受的调用数（只在整批校验通过时累计） |

@@ -41,8 +41,51 @@ func TestNamespacedToolCallPreservesNamespace(t *testing.T) {
 	if _, _, _, err := transformResponseBody(jsonBytes(map[string]any{"output": []any{native}}), source); err != nil {
 		t.Fatal(err)
 	}
-	if replay := translateInputItems([]any{call}); !reflect.DeepEqual(replay[0], native) {
-		t.Fatalf("cached replay = %#v, want %#v", replay[0], native)
+	replay, err := translateInputItems([]any{call})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route, code := rebuiltRoute(t, objectValue(replay[0])); route != "mcp__node_repl.js" || code != `{"code":"nodeRepl.write('ok')"}` {
+		t.Fatalf("cold rebuild changed the namespaced call: route=%q code=%q", route, code)
+	}
+}
+
+// rebuiltRoute 解出历史冷重建产生的 references 路由与逐字载荷。
+func rebuiltRoute(t *testing.T, item map[string]any) (string, string) {
+	t.Helper()
+	if item["name"] != transportName {
+		t.Fatalf("rebuilt history item is not the native transport call: %#v", item)
+	}
+	arguments, reason := parseRelayObject(item["arguments"])
+	if reason != "" {
+		t.Fatalf("rebuilt outer arguments unreadable: %s", reason)
+	}
+	references, _ := arguments["references"].([]any)
+	if len(references) != 1 {
+		t.Fatalf("rebuilt references = %#v, want exactly one", arguments["references"])
+	}
+	code, _ := arguments["code"].(string)
+	return stringValue(references[0]), code
+}
+
+// assertNoReplayableFailure 断言失败的尝试没有留下任何可借用的回放状态：同 call_id 的历史
+// 必须只按客户端条目自身的载荷冷重建，绝不携带先前失败批次的数据。
+func assertNoReplayableFailure(t *testing.T, callID, route, input string) {
+	t.Helper()
+	name, namespace := route, ""
+	if dot := strings.LastIndex(route, "."); dot > 0 {
+		name, namespace = route[dot+1:], route[:dot]
+	}
+	clientCall := map[string]any{"type": "custom_tool_call", "call_id": callID, "name": name, "input": input}
+	if namespace != "" {
+		clientCall["namespace"] = namespace
+	}
+	rebuild, err := translateInputItems([]any{clientCall})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRoute, code := rebuiltRoute(t, objectValue(rebuild[0])); gotRoute != route || code != input {
+		t.Fatalf("failed attempt left replayable state: %#v", rebuild[0])
 	}
 }
 
@@ -121,31 +164,33 @@ func TestClientToolIdentityAndReplay(t *testing.T) {
 				}
 			}
 			for _, output := range []any{"", "  text\n", []any{}, []any{map[string]any{"type": "input_image", "image_url": "data:image/png;base64,dGVzdA=="}}} {
-				for _, cached := range []bool{true, false} {
+				firstRebuild := ""
+				for _, seenEarlier := range []bool{true, false} {
 					historyCall := cloneObject(call)
-					if !cached {
-						historyCall["call_id"] = stringValue(call["call_id"]) + "_cache_miss"
+					if !seenEarlier {
+						historyCall["call_id"] = stringValue(call["call_id"]) + "_unseen"
 					}
 					result := map[string]any{"type": outputType, "call_id": historyCall["call_id"], "name": tc.name, "namespace": tc.namespace, "output": output}
-					replay := translateInputItems([]any{historyCall, result})
+					replay, err := translateInputItems([]any{historyCall, result})
+					if err != nil {
+						t.Fatal(err)
+					}
 					if len(replay) != 2 {
 						t.Fatalf("replay length = %d", len(replay))
 					}
 					replayedCall, replayedOutput := objectValue(replay[0]), objectValue(replay[1])
-					if cached && !reflect.DeepEqual(replayedCall, native) {
-						t.Fatalf("native replay changed: %#v", replayedCall)
+					route, code := rebuiltRoute(t, replayedCall)
+					if route != key || code != want {
+						t.Fatalf("rebuild route/code = %q/%q, want %q/%q", route, code, key, want)
 					}
-					// 命中缓存时原样回放旧封装；未命中时按新格式重建（references + 纯载荷）。
-					relay, err := transportEnvelope(replayedCall)
-					if err != nil || relay.tool != key || relay.legacy != cached {
-						t.Fatalf("replay envelope = %#v err=%v", relay, err)
+					if replayedCall["call_id"] != historyCall["call_id"] || replayedCall["id"] != functionItemID(stringValue(historyCall["call_id"])) {
+						t.Fatalf("rebuild lost the call identity: %#v", replayedCall)
 					}
-					if tc.kind == "custom" {
-						if relay.payload != args {
-							t.Fatalf("custom replay payload changed: %#v", relay.payload)
-						}
-					} else if parsed, reason := decodeFunctionArguments(relay.payload); reason != "" || !reflect.DeepEqual(parsed, args) {
-						t.Fatalf("function replay payload = %#v (%s)", parsed, reason)
+					// 冷重建只依赖当前条目：先前的请求（含同 call_id）不改变结果。
+					if serialized := stringValue(replayedCall["arguments"]); firstRebuild == "" {
+						firstRebuild = serialized
+					} else if serialized != firstRebuild {
+						t.Fatalf("rebuild depends on earlier requests: %s vs %s", serialized, firstRebuild)
 					}
 					if replayedOutput["type"] != "function_call_output" || replayedOutput["call_id"] != replayedCall["call_id"] || !reflect.DeepEqual(replayedOutput["output"], output) {
 						t.Fatalf("tool result changed: %#v", replayedOutput)
@@ -193,14 +238,16 @@ func TestClientToolArgumentsPreserveLargeIntegers(t *testing.T) {
 	if call["arguments"] != string(jsonBytes(args)) {
 		t.Fatalf("integer precision lost: %s", call["arguments"])
 	}
-	call["call_id"] = "call_uncached_" + t.Name()
-	replay := translateInputItems([]any{call})
-	relay, err := transportEnvelope(objectValue(replay[0]))
+	replay, err := translateInputItems([]any{call})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed, _ := decodeFunctionArguments(relay.payload); !reflect.DeepEqual(parsed, args) {
-		t.Fatalf("replay lost integer precision: %#v", relay)
+	route, code := rebuiltRoute(t, objectValue(replay[0]))
+	if route != "mcp__node_repl.js" || code != string(jsonBytes(args)) {
+		t.Fatalf("rebuild lost integer precision: route=%q code=%q", route, code)
+	}
+	if parsed, reason := parseRelayObject(code); reason != "" || !reflect.DeepEqual(parsed, map[string]any(args)) {
+		t.Fatalf("rebuilt payload = %#v (%s)", parsed, reason)
 	}
 }
 
@@ -248,8 +295,14 @@ func TestClientToolRejectsInvalidCallsWithoutLeakingNativeTools(t *testing.T) {
 			if strings.Contains(err.Error(), "private-invalid-args") {
 				t.Fatal("error exposed tool input")
 			}
-			if rememberedNativeCall(stringValue(native["call_id"])) != nil {
-				t.Fatal("failed response was partially cached")
+			// 坏批次不交付半批输出，也不影响后续同 call_id 的历史冷重建。
+			clientCall := map[string]any{"type": "function_call", "call_id": "call_rebuild_" + t.Name(), "name": "js", "namespace": "mcp__node_repl", "arguments": `{"code":"nodeRepl.write(1)"}`}
+			rebuild, rebuildErr := translateInputItems([]any{clientCall})
+			if rebuildErr != nil {
+				t.Fatal(rebuildErr)
+			}
+			if route, code := rebuiltRoute(t, objectValue(rebuild[0])); route != "mcp__node_repl.js" || code != `{"code":"nodeRepl.write(1)"}` {
+				t.Fatalf("failed batch poisoned later rebuild: %#v", rebuild[0])
 			}
 		})
 	}

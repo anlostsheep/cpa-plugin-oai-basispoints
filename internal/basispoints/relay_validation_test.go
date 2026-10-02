@@ -49,10 +49,9 @@ func TestRelayRejectsMalformedJSONWithoutRepair(t *testing.T) {
 			if strings.Contains(api.Message, "PRIVATE") {
 				t.Fatal("diagnostic leaked tool input")
 			}
+			// 失败批次不留下可借用的状态：同 call_id 的历史只按客户端条目自身冷重建。
 			for _, native := range []map[string]any{good, bad} {
-				if rememberedNativeCall(stringValue(native["call_id"])) != nil {
-					t.Fatal("failed batch was partially cached")
-				}
+				assertNoReplayableFailure(t, stringValue(native["call_id"]), "tools.invoke", "client-owned input")
 			}
 			if string(jsonBytes(original)) != before {
 				t.Fatal("original response was mutated")

@@ -173,9 +173,10 @@ func TestRelayRegenerationHTTP(t *testing.T) {
 					if mode == "exhausted" && (!strings.Contains(api.Message, "code invalid_json byte_offset=") || strings.Contains(api.Message, "data-id")) {
 						t.Fatalf("unsafe/incomplete diagnostic: %v", api)
 					}
-					if result != nil || len(gotEmitted) != 0 || len(done) != 0 || rememberedNativeCall(stringValue(bad["call_id"])) != nil {
-						t.Fatal("failed response leaked data/state")
+					if result != nil || len(gotEmitted) != 0 || len(done) != 0 {
+						t.Fatal("failed response leaked data")
 					}
+					assertNoReplayableFailure(t, stringValue(bad["call_id"]), "apply_patch", "client-owned input")
 					return
 				}
 				if err != nil {
@@ -199,9 +200,8 @@ func TestRelayRegenerationHTTP(t *testing.T) {
 					if failed["code"] != "invalid_tool_call" || !strings.Contains(message, "code invalid_json byte_offset=") || strings.Contains(message, "data-id") {
 						t.Fatalf("unsafe/incomplete in-stream diagnostic: %v", failed)
 					}
-					if rememberedNativeCall(stringValue(bad["call_id"])) != nil {
-						t.Fatal("rejected attempt cached")
-					}
+					// 失败尝试不留下可借用的状态：同 call_id 的历史只按客户端条目自身冷重建。
+					assertNoReplayableFailure(t, stringValue(bad["call_id"]), "apply_patch", "client-owned input")
 					return
 				}
 				var response map[string]any
@@ -229,9 +229,7 @@ func TestRelayRegenerationHTTP(t *testing.T) {
 				if fmt.Sprint(objectValue(response["usage"])["total_tokens"]) != "17" {
 					t.Fatal("terminal usage lost")
 				}
-				if rememberedNativeCall(stringValue(bad["call_id"])) != nil {
-					t.Fatal("rejected attempt cached")
-				}
+				assertNoReplayableFailure(t, stringValue(bad["call_id"]), "apply_patch", "client-owned input")
 			})
 		}
 	}

@@ -125,12 +125,11 @@ func TestTransitionLegacyNotCountedWhenBatchFails(t *testing.T) {
 	if !isKind(err, "invalid_tool_call") || stats.Legacy != 0 || stats.Calls != 0 {
 		t.Fatalf("failed batch must not count legacy calls: %+v %v", stats, err)
 	}
-	if rememberedNativeCall("call_batch-legacy") != nil {
-		t.Fatal("failed batch was partially cached")
-	}
+	// 失败批次不留下可借用的状态：同 call_id 的历史只按客户端条目自身冷重建。
+	assertNoReplayableFailure(t, "call_batch-legacy", "apply_patch", "ok")
 }
 
-// 历史里的 references:[]（缓存命中的旧原生调用）原样回放，不计入 legacy_calls。
+// 历史客户端条目不计入 legacy_calls，并按自身冷重建为 references + 纯载荷。
 func TestTransitionHistoryEmptyReferencesNotCounted(t *testing.T) {
 	source := namespaceTestSource("custom", "apply_patch", "")
 	old := transitionNative("hist-old", map[string]any{"references": []any{}, "code": legacyCode("apply_patch", "old")})
@@ -141,9 +140,12 @@ func TestTransitionHistoryEmptyReferencesNotCounted(t *testing.T) {
 		map[string]any{"type": "custom_tool_call", "call_id": "call_hist-old", "name": "apply_patch", "input": "old"},
 		map[string]any{"type": "custom_tool_call_output", "call_id": "call_hist-old", "output": "done"},
 	}
-	replay := translateInputItems(history)
-	if !strings.Contains(stringValue(objectValue(replay[0])["arguments"]), `"references":[]`) {
-		t.Fatalf("cached legacy call must replay verbatim: %#v", replay[0])
+	replay, err := translateInputItems(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route, code := rebuiltRoute(t, objectValue(replay[0])); route != "apply_patch" || code != "old" {
+		t.Fatalf("history must cold rebuild from the client entry: %#v", replay[0])
 	}
 	fresh := transitionNative("hist-new", map[string]any{"references": []any{"apply_patch"}, "code": "new"})
 	_, _, _, stats, err := transformResponseBodyStats(jsonBytes(map[string]any{"output": []any{fresh}}), source)

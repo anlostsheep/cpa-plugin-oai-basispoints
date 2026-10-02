@@ -30,9 +30,11 @@ func TestBufferedBadThenGoodDeliversOnlySecondAttempt(t *testing.T) {
 	bad, _ := relayFixture("call_buf_bad", true)
 	good, _ := relayFixture("call_buf_good", false)
 	first := newBPStream("resp_buf_1")
+	first.reasoning("第一次摘要，不应交付。", 3)
 	first.message("第一次的说明，不应交付。", 6)
 	first.tool(bad, 3)
 	second := newBPStream("resp_buf_2")
+	second.reasoning("第二次摘要。", 3)
 	second.message("第二次的说明。", 4)
 	second.tool(good, 3)
 	h := newIncHost(chunks(first.terminal(), 3), chunks(second.terminal(), 3))
@@ -54,8 +56,12 @@ func TestBufferedBadThenGoodDeliversOnlySecondAttempt(t *testing.T) {
 	if strings.Contains(h.snapshot(), "第一次") {
 		t.Fatal("failed attempt leaked to the client")
 	}
+	// buffered 的整轮回放不产生 reasoning_summary_* 增量，摘要只出现在 added/done 的完整 item 里。
+	if !strings.Contains(h.snapshot(), "第二次摘要。") || strings.Contains(h.snapshot(), "第一次摘要") {
+		t.Fatal("buffered replay must carry only the validated attempt's summary")
+	}
 	rec := h.waitSummary(t)
-	if rec.Delivery != "buffered" || rec.ConfigMode != StreamToolModeBuffered || rec.TextCommitted || rec.Regen != regenSuccess || rec.Attempts != 2 || rec.Exit != "completed" {
+	if rec.Delivery != "buffered" || rec.ConfigMode != StreamToolModeBuffered || rec.TextCommitted || rec.SummaryCommitted || rec.Regen != regenSuccess || rec.Attempts != 2 || rec.Exit != "completed" {
 		t.Fatalf("summary wrong: %+v", rec)
 	}
 	if logs := strings.Join(h.logMessages(), "\n"); strings.Contains(logs, "replayed at terminal without incremental delivery") {

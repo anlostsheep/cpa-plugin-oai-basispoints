@@ -11,8 +11,9 @@ import (
 // streamSession 管理一次 executor.execute_stream 的下游输出，供 http 与 ws 两种传输共用。
 //
 // 背景：工具调用需在完整 item 上安全转换，推理也在终态整批给出；ws 传输整轮缓冲，http 传输
-// 只提前交付 message 正文（streamDelivery 经 deliver 写入本会话）。没有输出的期间下游收不到
-// 字节，长回合会被 sub2api stream_data_interval_timeout(180s) 或 Codex 空闲超时(300s) 切断。
+// 只提前交付 message 正文与推理摘要（streamDelivery 经 deliver 写入本会话）。没有输出的期间
+// 下游收不到字节，长回合会被 sub2api stream_data_interval_timeout(180s) 或 Codex 空闲超时
+// (300s) 切断。
 // 会话开流（立即，或 http 已建连时等上游 response.created / 首次空闲心跳）后，在最近半个间隔
 // 没有输出时发送 response.in_progress 心跳；emit 失败即视为客户端已断开，立刻回调
 // onDisconnect 取消上游（ws 会据此发送 basispoints.response.cancel）。
@@ -354,8 +355,18 @@ func (ss *streamSession) finish(response map[string]any) string {
 }
 
 // finishWith 同 finish；keep 非 nil 时（增量交付已 commit）只回放 keep 保留的事件。
-// 返回实际收尾结果：插件已停止、客户端已断开或终态写出失败时都不算 completed。
 func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent) bool) string {
+	return ss.finishGenerated(response, keep, syntheticEvents)
+}
+
+// finishIncremental 是 HTTP 已提交增量路径专用的回放选择：终态事件改用带摘要增量的生成器
+// （syntheticEventsWithReasoningSummary），再由 keep 过滤/补齐；WS 与未提交 HTTP 继续走
+// finish/finishWith 的 legacy 形状，非流式对象不受影响。
+func (ss *streamSession) finishIncremental(response map[string]any, keep func(*sseEvent) bool) string {
+	return ss.finishGenerated(response, keep, syntheticEventsWithReasoningSummary)
+}
+
+func (ss *streamSession) finishGenerated(response map[string]any, keep func(*sseEvent) bool, generate func(map[string]any, bool) []sseEvent) string {
 	defer ss.markEnded()
 	ss.stop()
 	ss.mu.Lock()
@@ -375,7 +386,7 @@ func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent
 	if ss.started {
 		aligned := cloneObject(response)
 		aligned["id"] = ss.responseID
-		events = syntheticEvents(aligned, false)
+		events = generate(aligned, false)
 		if keep != nil {
 			kept := events[:0]
 			for i := range events {
@@ -386,7 +397,7 @@ func (ss *streamSession) finishWith(response map[string]any, keep func(*sseEvent
 			events = kept
 		}
 	} else {
-		events = syntheticEvents(response, true)
+		events = generate(response, true)
 	}
 	emitErr := ss.emitLocked(events, true)
 	ss.closed = true

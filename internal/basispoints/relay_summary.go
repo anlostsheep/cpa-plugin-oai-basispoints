@@ -73,12 +73,15 @@ type relaySummaryRecord struct {
 	ToolCallable  *bool  `json:"tool_callable"` // null：无法解析请求、不能判断
 	Attempts      int    `json:"attempts_started"`
 	TextCommitted bool   `json:"text_committed"`
-	First         string `json:"first"`
-	Final         string `json:"final"`
-	Regen         string `json:"regen"`
-	LegacyCalls   int    `json:"legacy_calls"`
-	Exit          string `json:"exit"`
-	ErrorKind     string `json:"error_kind"`
+	// SummaryCommitted 单列推理摘要交付：text_committed 保持正文（output_text）口径
+	// 不改成摘要；buffered 与未提交回放两者均为 false。
+	SummaryCommitted bool   `json:"summary_committed"`
+	First            string `json:"first"`
+	Final            string `json:"final"`
+	Regen            string `json:"regen"`
+	LegacyCalls      int    `json:"legacy_calls"`
+	Exit             string `json:"exit"`
+	ErrorKind        string `json:"error_kind"`
 }
 
 // relaySummary 在一次执行内累计状态，并在收尾时恰好写一次日志。
@@ -178,9 +181,15 @@ func (r *relaySummary) attemptStarted() {
 	r.mu.Unlock()
 }
 
-func (r *relaySummary) markTextCommitted() {
+// markDelivery 记录已交给宿主流的内容种类（正文与推理摘要分别累计；buffered 不调用）。
+func (r *relaySummary) markDelivery(textCommitted, summaryCommitted bool) {
 	r.mu.Lock()
-	r.rec.TextCommitted = true
+	if textCommitted {
+		r.rec.TextCommitted = true
+	}
+	if summaryCommitted {
+		r.rec.SummaryCommitted = true
+	}
 	r.mu.Unlock()
 }
 

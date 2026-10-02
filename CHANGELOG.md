@@ -1,5 +1,26 @@
 # 更新日志
 
+## v0.1.18.0 — 2026-10-02
+
+HTTP 流式推理摘要增量交付（取代 0.1.16.0 起的「推理摘要只在终态整批回放」；只影响 http 增量交付路径），并包含客户端历史冷重建与用户图片的全请求本地预检。
+
+### 变更
+
+- **推理摘要边读边转发**：http 流式下 `reasoning_summary_part.added` / `reasoning_summary_text.delta` / `reasoning_summary_text.done` / `reasoning_summary_part.done` 与 message 正文一样在上游给出后即转发；推理 item 的开场事件原样携带上游给出的字段，已给出的非空 `encrypted_content` 随开场交付，终态必须与已交付的密文一致，缺失或为空时由终态补全。未交付任何内容前仍可重新生成一次；正文或摘要任一首次交付后不再重新生成，工具格式错误直接以 `response.failed`（`invalid_tool_call`）结束，避免重复输出。
+- **终态一致性核对扩展到摘要**：终态 response id、`output_index` / `summary_index`、item id、摘要文本（终态须以已交付摘要为前缀）、`encrypted_content`（added 已交付的非空值被替换即为冲突）都必须与已交付内容一致，否则以请求级 `invalid_upstream_stream` 结束（`response.failed`）；生命周期事件（part/text done、item done）在同一口径下不允许重复。终态只补发未交付的摘要后缀与未交付的生命周期事件。
+- **开场字段归一化**：`output_item.added` / `reasoning_summary_part.added` 中预填的 summary / text 规范化为空开场（客户端只用 delta 组装摘要，防止重复）；id 与密文原样保留。
+- **未提交路径保持原形状**：buffered、ws、非流式与未满足增量提交前提（缺 `response.created`、缺 item/part 开场事件、提交批内乱序或重复等）的 http 回合仍按 0.1.17.1 的完整回放（added 携带完整 summary，无 `reasoning_summary_*` 增量事件）；提交前提按正文与摘要各自的 item/part 开启事件独立检查，未满足时在尚未交付任何内容前整体退回终态回放，有正文却未能增量交付的情形照旧写计数日志。已交付后到达的同类冲突仍以 `invalid_upstream_stream` 失败，提交后的乱序/重复/内容不一致不放宽。
+- **客户端历史冷重建**：客户端历史里的 function / custom 调用按条目自身重建为新中继格式（字符串载荷逐字保留、custom 原文不解码、对象参数保留原始数字），不再依赖当前工具目录或进程内缓存；直接提交的 native 传输调用按原文保留。剥离条目内元数据（`internal_chat_message_metadata_passthrough`）不再经过 JSON 往返，超出 float64 精度的大整数（对象参数等）保持原样。
+- **用户图片全请求本地预检**：在发送任何附件上传或 Responses 请求之前，先对整个请求的用户消息图片做零网络预检——引用冲突（`file_id` 与 `image_url` 同时非空）、data URL 形状、实际字节格式（声明门禁、base64、格式签名）全部通过后才开始上传；任一后部图片失败都让本次请求零上传、零生成。上传阶段本身与远程 URL、工具结果图片的处理不变（按需上传、失败不回滚已上传的缓存条目）。
+
+### 新增
+
+- `relay_summary` 新增 `summary_committed` 字段：工具校验前推理摘要是否已进入交付边界；`text_committed` 保持正文（`output_text`）口径不变，两者独立计数。buffered、未提交回放、ws 与非流式均为 `false`；0 长度增量不算交付。
+
+### 说明
+
+- 本地验证：全量 `go test -race`、`go vet`；本轮修订后以同一固定夹具重跑回放基线，7 个场景（生成器带/不带 prologue、非流式 Payload、未提交 HTTP、buffered、WS 端到端、http 增量摘要）与上一轮留存的实现后产物逐字节一致；相对 b456e3d（0.1.17.1）采集的修改前基线，除「http 增量 + 非空摘要」场景按预期变化（摘要提前交付、终态不再重复）外也逐字节一致。owner 复核探针（对象参数大整数精度、缺 summary part.added 的回退、空摘要增量不记交付）与对应的常驻回归通过。这不等于真实上游或现网部署验收。
+
 ## v0.1.17.1 — 2026-10-02（UTC）
 
 移植原仓库 JaxsonWang/cpa-plugin-oai-basispoints v0.2.4（`08e349c`，MIT）的用户图片修复。这是预防性修复：RK 现网在本次观察窗口内的图片都以 data URL 内联在请求中（推断来自工具结果），没有走插件的上传路径；本版只修正已知的用户消息图片缺陷，不宣称会改善那些已经成功的内联请求。

@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -58,7 +57,7 @@ func TestPrepareResponsesBodyStripsToolsAndUsesNaturalLanguageCatalog(t *testing
 	}
 }
 
-func TestTransportCodeUsesToolAndArgsAndPreservesNativeItem(t *testing.T) {
+func TestTransportCodeUsesToolAndArgsAndColdRebuildsHistoryItem(t *testing.T) {
 	source := map[string]any{
 		"tools": []any{map[string]any{
 			"type": "function",
@@ -104,7 +103,7 @@ func TestTransportCodeUsesToolAndArgsAndPreservesNativeItem(t *testing.T) {
 	if clientCall["name"] != "get_weather" {
 		t.Fatalf("client call = %#v", clientCall)
 	}
-	items := translateInputItems([]any{
+	replay, err := translateInputItems([]any{
 		clientCall,
 		map[string]any{
 			"type":    "function_call_output",
@@ -112,10 +111,13 @@ func TestTransportCodeUsesToolAndArgsAndPreservesNativeItem(t *testing.T) {
 			"output":  "18°C",
 		},
 	})
-	if !reflect.DeepEqual(items[0], native) {
-		t.Fatalf("replayed native item = %#v, want %#v", items[0], native)
+	if err != nil {
+		t.Fatal(err)
 	}
-	output := objectValue(items[1])
+	if route, code := rebuiltRoute(t, objectValue(replay[0])); route != "get_weather" || code != `{"city":"Tokyo"}` {
+		t.Fatalf("cold rebuild changed the native item: route=%q code=%q", route, code)
+	}
+	output := objectValue(replay[1])
 	if output["type"] != "function_call_output" || output["id"] != "fc_call_native_weather" || output["output"] != "18°C" {
 		t.Fatalf("normalized output = %#v", output)
 	}

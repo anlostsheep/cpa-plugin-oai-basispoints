@@ -55,7 +55,10 @@ func TestRelayPayloadAvoidsNestedJSON(t *testing.T) {
 					t.Fatal("function payload changed")
 				}
 			}
-			replay := fallbackTransportCall(call)
+			replay, fallbackErr := fallbackTransportCall(call)
+			if fallbackErr != nil {
+				t.Fatal(fallbackErr)
+			}
 			outer := parseArguments(replay["arguments"])
 			if !reflect.DeepEqual(outer["references"], []any{"tools.invoke"}) {
 				t.Fatal("history lost tool routing")
@@ -123,10 +126,9 @@ func TestRelayValidationIsAtomic(t *testing.T) {
 	if err == nil || body != nil || response != nil || changed {
 		t.Fatal("failed response partially delivered")
 	}
+	// 失败批次不留下可借用的状态：同 call_id 的历史只按客户端条目自身冷重建。
 	for _, call := range []map[string]any{good, bad} {
-		if rememberedNativeCall(stringValue(call["call_id"])) != nil {
-			t.Fatal("failed response partially cached")
-		}
+		assertNoReplayableFailure(t, stringValue(call["call_id"]), "apply_patch", "client-owned input")
 	}
 	if string(jsonBytes(original)) != before {
 		t.Fatal("original payload mutated")
@@ -144,7 +146,10 @@ func TestRelayPreservesPreviousNativeHistory(t *testing.T) {
 			}
 			source := namespaceTestSource("custom", "apply_patch", "")
 			result := map[string]any{"type": "custom_tool_call_output", "call_id": t.Name(), "output": "already executed"}
-			replay := translateInputItems([]any{legacy, result})
+			replay, err := translateInputItems([]any{legacy, result})
+			if err != nil {
+				t.Fatal(err)
+			}
 			if len(replay) != 2 || !reflect.DeepEqual(replay[0], legacy) {
 				t.Fatal("old native history rewritten")
 			}

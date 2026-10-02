@@ -140,79 +140,123 @@ func isUserImageMessage(item map[string]any) bool {
 	return stringValue(item["role"]) == "user" && (itemType == "" || itemType == "message")
 }
 
-// uploadInputImages 规范化用户消息里的图片（移植自上游 08e349c，#17）：
-//   - 先预检整个请求的用户消息图片：任何一处同时带 file_id 与 image_url，就在任何附件上传
-//     或 Responses 调用之前返回 400（上游实现是逐张处理，前面的图片会先被上传）；
-//   - data URL 上传后、已有 file_id 直接，都只发 {type, file_id}：Basis Points 的文件引用
-//     不接受 detail 等字段（真实上游带 detail 返回 422）；
-//   - 远程 URL 原样保留；工具结果里的图片不在这里处理。
-func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any, c credential, cfg Config) error {
-	items, _ := body["input"].([]any)
+// attachmentKey 是附件缓存身份：与响应端点同源，并绑定账户、认证模式、凭据与实际格式；
+// 相同字节以不同 image/* 声明上传时命中同一条目。
+func attachmentKey(endpoint string, c credential, mediaType string, data []byte) [sha256.Size]byte {
+	hash := sha256.New()
+	_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, c.AccessToken, mediaType}))
+	_, _ = hash.Write(data)
+	var key [sha256.Size]byte
+	copy(key[:], hash.Sum(nil))
+	return key
+}
+
+// plannedImage 是预检阶段确定的一次图片处理计划：fileID 非空表示沿用已有引用，否则按
+// imageURL 上传；key 是缓存身份。
+type plannedImage struct {
+	itemIndex int
+	partIndex int
+	fileID    string
+	imageURL  string
+	key       [sha256.Size]byte
+}
+
+// planInputImages 在零网络前提下预检整个请求的用户消息图片：引用冲突、data URL 形状与
+// 实际字节格式（声明门禁、基址64、格式签名）。全部通过后调用方才允许上传；任一后部图片
+// 失败都让本次请求零上传、零生成（引用形状按 v0.1.17.1：非空字符串才参与冲突判断）。
+func planInputImages(items []any, responsesURL string, c credential) ([]plannedImage, string, error) {
+	var plan []plannedImage
+	endpoint := ""
 	for i, value := range items {
 		item := objectValue(value)
 		if !isUserImageMessage(item) {
 			continue
 		}
 		parts, _ := item["content"].([]any)
-		for j, value := range parts {
-			part := objectValue(value)
-			if stringValue(part["type"]) == "input_image" && stringValue(part["file_id"]) != "" && stringValue(part["image_url"]) != "" {
-				return fail(400, "invalid_image", fmt.Sprintf("input[%d].content[%d]: input_image cannot contain both image_url and file_id", i, j))
-			}
-		}
-	}
-	for i, value := range items {
-		item := objectValue(value)
-		if !isUserImageMessage(item) {
-			continue
-		}
-		parts, _ := item["content"].([]any)
-		var updated []any
 		for j, value := range parts {
 			part := objectValue(value)
 			if stringValue(part["type"]) != "input_image" {
 				continue
 			}
+			imageURL := stringValue(part["image_url"])
 			fileID := stringValue(part["file_id"])
-			if fileID == "" {
-				imageURL := stringValue(part["image_url"])
-				if len(imageURL) < 5 || !strings.EqualFold(imageURL[:5], "data:") {
-					continue
+			if fileID != "" && imageURL != "" {
+				return nil, "", fail(400, "invalid_image", fmt.Sprintf("input[%d].content[%d]: input_image cannot contain both image_url and file_id", i, j))
+			}
+			if fileID != "" {
+				plan = append(plan, plannedImage{itemIndex: i, partIndex: j, fileID: fileID})
+				continue
+			}
+			// 非 data URL（远程 URL、空字段）不新增下载行为，原样保留。
+			if len(imageURL) < 5 || !strings.EqualFold(imageURL[:5], "data:") {
+				continue
+			}
+			image, err := decodeInlineImage(imageURL)
+			if err != nil {
+				var apiErr *APIError
+				if errors.As(err, &apiErr) {
+					return nil, "", fail(apiErr.Status, apiErr.Kind, fmt.Sprintf("input[%d].content[%d]: %s", i, j, apiErr.Message))
 				}
-				image, err := decodeInlineImage(imageURL)
-				if err != nil {
-					var apiErr *APIError
-					if errors.As(err, &apiErr) {
-						return fail(apiErr.Status, apiErr.Kind, fmt.Sprintf("input[%d].content[%d]: %s", i, j, apiErr.Message))
-					}
-					return err
-				}
-				endpoint, err := attachmentURL(cfg.ResponsesURL)
-				if err != nil {
-					return err
-				}
-				hash := sha256.New()
-				_, _ = hash.Write(jsonBytes([]string{endpoint, c.AccountID, c.AuthMode, c.AccessToken, image.mediaType}))
-				_, _ = hash.Write(image.data)
-				var key [sha256.Size]byte
-				copy(key[:], hash.Sum(nil))
-				fileID, err = s.attachments.getOrUpload(key, func() (string, error) {
-					return s.uploadImage(request, endpoint, image, c)
-				})
-				if err != nil {
-					return err
+				return nil, "", err
+			}
+			if endpoint == "" {
+				if endpoint, err = attachmentURL(responsesURL); err != nil {
+					return nil, "", err
 				}
 			}
-			if updated == nil {
-				updated = append([]any(nil), parts...)
+			plan = append(plan, plannedImage{itemIndex: i, partIndex: j, imageURL: imageURL, key: attachmentKey(endpoint, c, image.mediaType, image.data)})
+		}
+	}
+	return plan, endpoint, nil
+}
+
+// uploadInputImages 规范化用户消息里的图片（移植自上游 08e349c，#17）：
+//   - 先对整个请求做无网络预检（planInputImages）：引用冲突、data URL 与字节格式全部
+//     通过后才开始上传；任何一张后部图片非法都不会上传前面的图片或发出生成请求；
+//   - data URL 上传后、已有 file_id 直接，都只发 {type, file_id}：Basis Points 的文件引用
+//     不接受 detail 等字段（真实上游带 detail 返回 422）；
+//   - 远程 URL 原样保留；工具结果里的图片不在这里处理；
+//   - 上传中途的网络失败如实返回，不假装回滚已上传的图片（缓存条目仍可复用）。
+func (s *Service) uploadInputImages(request ExecutorRequest, body map[string]any, c credential, cfg Config) error {
+	items, _ := body["input"].([]any)
+	plan, endpoint, err := planInputImages(items, cfg.ResponsesURL, c)
+	if err != nil {
+		// 插件已停止（取消已存在）时取消优先于校验错误，与守卫的中止优先级一致，
+		// 避免插件重载被误报成客户端输入错误。
+		if stoppedByShutdown(request.lifeCtx) {
+			return stoppedError()
+		}
+		return err
+	}
+	if len(plan) == 0 {
+		return nil
+	}
+	touched := map[int][]any{}
+	for _, entry := range plan {
+		fileID := entry.fileID
+		if fileID == "" {
+			fileID, err = s.attachments.getOrUpload(entry.key, func() (string, error) {
+				image, err := decodeInlineImage(entry.imageURL)
+				if err != nil {
+					return "", err
+				}
+				return s.uploadImage(request, endpoint, image, c)
+			})
+			if err != nil {
+				return err
 			}
-			updated[j] = map[string]any{"type": "input_image", "file_id": fileID}
 		}
-		if updated != nil {
-			copy := cloneObject(item)
-			copy["content"] = updated
-			items[i] = copy
+		parts, planned := touched[entry.itemIndex]
+		if !planned {
+			parts = append([]any(nil), objectValue(items[entry.itemIndex])["content"].([]any)...)
+			touched[entry.itemIndex] = parts
 		}
+		parts[entry.partIndex] = map[string]any{"type": "input_image", "file_id": fileID}
+	}
+	for index, parts := range touched {
+		copy := cloneObject(objectValue(items[index]))
+		copy["content"] = parts
+		items[index] = copy
 	}
 	return nil
 }

@@ -55,12 +55,14 @@ func TestToolChoiceDiagnosticPreservesAuthorization(t *testing.T) {
 							if !errors.As(err, &api) || api.Status != 422 || api.Kind != "invalid_tool_call" || !strings.HasSuffix(api.Message, ": "+wantReason) {
 								t.Fatalf("want %s diagnostic, got %v", wantReason, err)
 							}
-							if body != nil || response != nil || changed || rememberedNativeCall(t.Name()) != nil {
-								t.Fatal("disallowed call was delivered or cached")
+							if body != nil || response != nil || changed {
+								t.Fatal("disallowed call was delivered")
 							}
 							if strings.Contains(api.Message, "PRIVATE") {
 								t.Fatal("diagnostic leaked tool input")
 							}
+							// 失败尝试不留下可借用的状态：同 call_id 的历史只按客户端条目自身冷重建。
+							assertNoReplayableFailure(t, t.Name(), key, "client-owned input")
 							return
 						}
 						if err != nil || !changed {

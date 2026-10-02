@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -30,12 +29,6 @@ type toolSpec struct {
 	Type      string
 	Spec      map[string]any
 }
-
-var nativeCallCache = struct {
-	sync.Mutex
-	items map[string]map[string]any
-	order []string
-}{items: map[string]map[string]any{}}
 
 func iterToolValues(tools any, namespace string, callback func(toolSpec)) {
 	list, ok := tools.([]any)
@@ -271,12 +264,20 @@ func objectValue(value any) map[string]any {
 	return object
 }
 
+// stripClientMetadata 移除客户端携带的条目内元数据。返回顶层浅拷贝（嵌套值与源请求共享，
+// 与无该字段时原样返回的既有路径一致），避免 cloneObject 的 JSON 往返把对象参数里的
+// json.Number 转成 float64，丢失大整数精度；调用方把它当只读视图使用。
 func stripClientMetadata(item map[string]any) map[string]any {
 	if _, exists := item["internal_chat_message_metadata_passthrough"]; !exists {
 		return item
 	}
-	copy := cloneObject(item)
-	delete(copy, "internal_chat_message_metadata_passthrough")
+	copy := make(map[string]any, len(item))
+	for key, value := range item {
+		if key == "internal_chat_message_metadata_passthrough" {
+			continue
+		}
+		copy[key] = value
+	}
 	return copy
 }
 
@@ -288,31 +289,6 @@ func cloneObject(object map[string]any) map[string]any {
 	var copy map[string]any
 	_ = json.Unmarshal(raw, &copy)
 	return copy
-}
-
-func rememberNativeCall(item map[string]any) {
-	callID := stringValue(item["call_id"])
-	if callID == "" {
-		return
-	}
-	copy := cloneObject(item)
-	nativeCallCache.Lock()
-	defer nativeCallCache.Unlock()
-	if _, exists := nativeCallCache.items[callID]; !exists {
-		nativeCallCache.order = append(nativeCallCache.order, callID)
-	}
-	nativeCallCache.items[callID] = copy
-	for len(nativeCallCache.order) > 512 {
-		oldest := nativeCallCache.order[0]
-		nativeCallCache.order = nativeCallCache.order[1:]
-		delete(nativeCallCache.items, oldest)
-	}
-}
-
-func rememberedNativeCall(callID string) map[string]any {
-	nativeCallCache.Lock()
-	defer nativeCallCache.Unlock()
-	return cloneObject(nativeCallCache.items[callID])
 }
 
 func functionItemID(callID string) string {
@@ -333,18 +309,31 @@ func clientToolCallName(item map[string]any) string {
 	return name
 }
 
-func fallbackTransportCall(item map[string]any) map[string]any {
+// fallbackTransportCall 从客户端历史条目冷重建 references envelope：不依赖进程内其他
+// 请求的数据，也不依赖当前工具目录。历史字符串载荷逐字保留（含非法 JSON、非对象 JSON 与
+// 空白）；对象载荷用保留 json.Number 的规范化编码；无法无损表达的类型明确 400。
+func fallbackTransportCall(item map[string]any) (map[string]any, error) {
 	name := clientToolCallName(item)
 	callID := stringValue(item["call_id"])
 	if callID == "" {
 		callID = "call_bp_" + shortHash(fmt.Sprintf("%v", time.Now().UnixNano()))
 	}
+	var payload string
+	if stringValue(item["type"]) == "custom_tool_call" {
+		input, ok := item["input"].(string)
+		if !ok {
+			return nil, historyRelayError("custom tool input must be a string")
+		}
+		payload = input
+	} else if arguments, ok := item["arguments"].(string); ok {
+		payload = arguments
+	} else if object := objectValue(item["arguments"]); object != nil {
+		payload = string(jsonBytes(object))
+	} else {
+		return nil, historyRelayError("function arguments must be a string or a JSON object")
+	}
 	// 按新中继格式重建（移植自上游 1b9359a / 019e97d）：references 指定工具，code 只放载荷；
 	// function 载荷是参数 JSON 文本原样，custom 载荷是原文。
-	payload, _ := item["arguments"].(string)
-	if stringValue(item["type"]) == "custom_tool_call" {
-		payload, _ = item["input"].(string)
-	}
 	outerArguments := map[string]any{
 		"summary":          "Run client tool " + name,
 		"extended_summary": "Relay " + name + " through the external client",
@@ -359,19 +348,26 @@ func fallbackTransportCall(item map[string]any) map[string]any {
 		"name":      transportName,
 		"arguments": string(jsonBytes(outerArguments)),
 		"status":    "completed",
-	}
+	}, nil
 }
 
-// translateInputItems 把客户端历史转换为上游输入。历史调用自身已带名称与载荷，重建不依赖
-// 当前工具目录（压缩请求等可能没有目录；移植自上游 PR #14 019e97d）。缓存里的原生调用
-// 原样回放（可能是旧 {tool,args} 封装），不按新输出的规则校验。
-func translateInputItems(rawInput any) []any {
+// historyRelayError 表示客户端历史条目无法按下游可见的载荷形态无损回放：请求级 400，
+// 诊断只含类别，不含载荷内容。
+func historyRelayError(reason string) error {
+	return fail(400, "unsupported_history_tool_input", "oai-basispoints cannot relay a historical tool call: "+reason)
+}
+
+// translateInputItems 把客户端历史转换为上游输入。每个客户端调用都从它自身按名称/命名空间/
+// 类型/载荷冷重建，不依赖当前工具目录（压缩请求等可能没有目录；移植自上游 PR #14 019e97d），
+// 也不借用其他请求留下的原生调用：相同 call_id 的不同工具、载荷与凭据互不影响。客户端直接
+// 提交的 native 历史（名称为传输名/别名）按原文保留，它是客户端自己的记录，无更早载荷可还原。
+func translateInputItems(rawInput any) ([]any, error) {
 	if text, ok := rawInput.(string); ok {
-		return []any{messageItem("user", text)}
+		return []any{messageItem("user", text)}, nil
 	}
 	items, ok := rawInput.([]any)
 	if !ok {
-		return []any{}
+		return []any{}, nil
 	}
 	result := make([]any, 0, len(items))
 	origins := map[string]string{}
@@ -384,31 +380,26 @@ func translateInputItems(rawInput any) []any {
 		itemType := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
 		if itemType == "function_call" || itemType == "custom_tool_call" {
 			callID := stringValue(item["call_id"])
-			if native := rememberedNativeCall(callID); native != nil {
-				if callID != "" {
-					origins[callID] = stringValue(native["name"])
-				}
-				result = append(result, native)
-				continue
-			}
-			name := clientToolCallName(item)
-			if name == transportName || name == transportAlias {
-				rememberNativeCall(item)
+			if name := clientToolCallName(item); isTransportName(name) {
 				if callID != "" {
 					origins[callID] = transportName
 				}
 				result = append(result, item)
 				continue
 			}
+			rebuilt, err := fallbackTransportCall(item)
+			if err != nil {
+				return nil, err
+			}
 			if callID != "" {
 				origins[callID] = transportName
 			}
-			result = append(result, fallbackTransportCall(item))
+			result = append(result, rebuilt)
 			continue
 		}
 		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
 			callID := stringValue(item["call_id"])
-			if origins[callID] == transportName || rememberedNativeCall(callID) != nil {
+			if origins[callID] == transportName {
 				copy := cloneObject(item)
 				copy["type"] = "function_call_output"
 				copy["id"] = functionItemID(callID)
@@ -439,7 +430,7 @@ func translateInputItems(rawInput any) []any {
 		}
 		result = append(result, item)
 	}
-	return result
+	return result, nil
 }
 
 func itemText(value any) string {
@@ -572,7 +563,10 @@ func prepareResponsesBody(source map[string]any, cfg Config) (map[string]any, er
 	if clientToolCallRequired(source) && len(callableClientToolSpecs(source)) == 0 {
 		return nil, fail(400, "invalid_tool_choice", "tool_choice does not select any available client tool")
 	}
-	inputItems := translateInputItems(source["input"])
+	inputItems, err := translateInputItems(source["input"])
+	if err != nil {
+		return nil, err
+	}
 	historyRoot := conversationFingerprint(inputItems)
 	prologue := []any{}
 	if instructions := stringValue(source["instructions"]); instructions != "" {
@@ -976,9 +970,6 @@ func transformResponseBodyStats(body []byte, source map[string]any) ([]byte, map
 	if parallel, ok := source["parallel_tool_calls"].(bool); ok && !parallel && len(natives) > 1 {
 		return nil, nil, false, stats, relayError("parallel_tool_calls_disabled")
 	}
-	for _, native := range natives {
-		rememberNativeCall(native)
-	}
 	// 只有整批校验通过才计入（失败批次已在上面返回）。
 	stats.Calls, stats.Legacy = len(natives), legacy
 	response["output"] = replaced
@@ -992,8 +983,22 @@ type sseEvent struct {
 }
 
 // syntheticEvents 把完整 Responses 响应展开成客户端事件序列。withPrologue=false 时省略
-// response.created/in_progress（由流式会话提前发出并用心跳保活）。
+// response.created/in_progress（由流式会话提前发出并用心跳保活）。reasoning item 保持冻结的
+// legacy 形状：added 携带完整 summary，不发 reasoning_summary_* 增量事件（WS、未提交 HTTP
+// 与 buffered 回放使用）。
 func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
+	return syntheticEventsFor(response, withPrologue, false)
+}
+
+// syntheticEventsWithReasoningSummary 是 HTTP 已提交增量路径专用的终态回放生成器：reasoning
+// item 先以空 summary 开场，再逐段给出 reasoning_summary_part/text 事件（与上游 v0.2.9
+// emitReasoningSummary 的形状一致，MIT），最后 output_item.done 保留完整 item/密文；
+// 其余事件（消息、工具、终止）与 syntheticEvents 完全一致。
+func syntheticEventsWithReasoningSummary(response map[string]any, withPrologue bool) []sseEvent {
+	return syntheticEventsFor(response, withPrologue, true)
+}
+
+func syntheticEventsFor(response map[string]any, withPrologue, reasoningSummary bool) []sseEvent {
 	if response == nil {
 		return nil
 	}
@@ -1023,11 +1028,15 @@ func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
 			}
 			added := cloneObject(item)
 			isMessage := stringValue(item["type"]) == "message"
+			isReasoning := stringValue(item["type"]) == "reasoning"
 			if isMessage {
 				// 与上游 #12 一致：message 先以空内容开场，再逐段给出 content_part / output_text 事件，
 				// 客户端按事件（而非 added 里的全量 content）组装正文。
 				added["status"] = "in_progress"
 				added["content"] = []any{}
+			}
+			if isReasoning && reasoningSummary {
+				added["summary"] = []any{}
 			}
 			if field != "" {
 				added[field] = ""
@@ -1044,6 +1053,8 @@ func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
 				add(event+".done", map[string]any{"output_index": index, "item_id": item["id"], field: text})
 			} else if isMessage {
 				events = append(events, messageContentEvents(index, item)...)
+			} else if isReasoning && reasoningSummary {
+				events = append(events, reasoningSummaryEvents(index, item)...)
 			}
 			add("response.output_item.done", map[string]any{"output_index": index, "item": item})
 		}
@@ -1055,6 +1066,30 @@ func syntheticEvents(response map[string]any, withPrologue bool) []sseEvent {
 	} else {
 		terminal["status"] = "completed"
 		add("response.completed", map[string]any{"response": terminal})
+	}
+	return events
+}
+
+// reasoningSummaryEvents 为 reasoning item 的 summary 逐段生成 reasoning_summary 事件
+// （移植自上游 JaxsonWang/cpa-plugin-oai-basispoints v0.2.9 emitReasoningSummary，MIT）：
+// 非 summary_text 部件跳过，完整 item/密文只在 output_item.done 中给出。
+func reasoningSummaryEvents(outputIndex int, item map[string]any) []sseEvent {
+	summary, _ := item["summary"].([]any)
+	events := make([]sseEvent, 0, len(summary)*4)
+	for summaryIndex, value := range summary {
+		part := objectValue(value)
+		if stringValue(part["type"]) != "summary_text" {
+			continue
+		}
+		added := cloneObject(part)
+		added["text"] = ""
+		events = append(events, sseEvent{name: "response.reasoning_summary_part.added", value: map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "part": added}})
+		text, _ := part["text"].(string)
+		if text != "" {
+			events = append(events, sseEvent{name: "response.reasoning_summary_text.delta", value: map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "delta": text}})
+		}
+		events = append(events, sseEvent{name: "response.reasoning_summary_text.done", value: map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "text": text}})
+		events = append(events, sseEvent{name: "response.reasoning_summary_part.done", value: map[string]any{"output_index": outputIndex, "item_id": item["id"], "summary_index": summaryIndex, "part": part}})
 	}
 	return events
 }

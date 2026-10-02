@@ -51,15 +51,26 @@ func splitText(text string, n int) []string {
 }
 
 func (s *bpStream) reasoning(summary string, deltas int) {
-	idx, id := len(s.output), fmt.Sprintf("rs_%d", len(s.output))
-	item := map[string]any{"type": "reasoning", "id": id, "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "enc-synthetic"}
-	s.add("response.output_item.added", map[string]any{"output_index": idx, "item": map[string]any{"type": "reasoning", "id": id, "summary": []any{}}})
-	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": idx, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
-	for _, d := range splitText(summary, deltas) {
-		s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": idx, "item_id": id, "summary_index": 0, "delta": d})
+	s.reasoningParts(fmt.Sprintf("rs_%d", len(s.output)), []string{summary}, deltas)
+}
+
+// reasoningParts 生成多 summary 部件的推理条目（每个部件按 deltas 均分）。
+func (s *bpStream) reasoningParts(id string, parts []string, deltas int) {
+	idx := len(s.output)
+	summary := make([]any, 0, len(parts))
+	for _, text := range parts {
+		summary = append(summary, map[string]any{"type": "summary_text", "text": text})
 	}
-	s.add("response.reasoning_summary_text.done", map[string]any{"output_index": idx, "item_id": id, "summary_index": 0, "text": summary})
-	s.add("response.reasoning_summary_part.done", map[string]any{"output_index": idx, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
+	item := map[string]any{"type": "reasoning", "id": id, "summary": summary, "encrypted_content": "enc-synthetic"}
+	s.add("response.output_item.added", map[string]any{"output_index": idx, "item": map[string]any{"type": "reasoning", "id": id, "summary": []any{}}})
+	for partIndex, text := range parts {
+		s.add("response.reasoning_summary_part.added", map[string]any{"output_index": idx, "item_id": id, "summary_index": partIndex, "part": map[string]any{"type": "summary_text", "text": ""}})
+		for _, d := range splitText(text, deltas) {
+			s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": idx, "item_id": id, "summary_index": partIndex, "delta": d})
+		}
+		s.add("response.reasoning_summary_text.done", map[string]any{"output_index": idx, "item_id": id, "summary_index": partIndex, "text": text})
+		s.add("response.reasoning_summary_part.done", map[string]any{"output_index": idx, "item_id": id, "summary_index": partIndex, "part": map[string]any{"type": "summary_text", "text": text}})
+	}
 	s.add("response.output_item.done", map[string]any{"output_index": idx, "item": item})
 	s.output = append(s.output, item)
 }
@@ -300,6 +311,17 @@ func streamedText(events []map[string]any) string {
 	return b.String()
 }
 
+func streamedSummary(events []map[string]any) string {
+	var b strings.Builder
+	for _, e := range events {
+		if e["type"] == "response.reasoning_summary_text.delta" {
+			delta, _ := e["delta"].(string)
+			b.WriteString(delta)
+		}
+	}
+	return b.String()
+}
+
 func countType(events []map[string]any, kind string) int {
 	n := 0
 	for _, e := range events {
@@ -333,12 +355,14 @@ func terminalEvent(t *testing.T, events []map[string]any) map[string]any {
 
 // ---- A1–A4：HTTP 路径 ----
 
-// 夹具 A（场景3 第1轮）：推理 → 正文 → 工具。正文在终态前到达；推理、工具只在终态后回放。
+// 夹具 A（场景3 第1轮）：推理 → 正文 → 工具。摘要与正文在终态前到达（摘要先于正文）；
+// 工具只在终态后回放，摘要/正文各交付一次且不重复。
 func TestIncrementalTextArrivesBeforeTerminal(t *testing.T) {
 	text := "表格已检查，下面把第 3 行的公式改成求和，并保留原有格式。"
+	summary := "先查看工作表结构，再决定如何修改公式。"
 	call, _ := relayFixture("call_scene3", false)
 	s := newBPStream("resp_up_scene3")
-	s.reasoning("先查看工作表结构，再决定如何修改公式。", 94)
+	s.reasoning(summary, 94)
 	s.message(text, 27)
 	s.tool(call, 5)
 	blocks := s.terminal()
@@ -349,10 +373,13 @@ func TestIncrementalTextArrivesBeforeTerminal(t *testing.T) {
 
 	h.waitFor(t, "response.output_text.delta")
 	early := h.snapshot()
-	for _, forbidden := range []string{"response.completed", "reasoning", "function_call", "custom_tool_call"} {
+	for _, forbidden := range []string{"response.completed", "function_call", "custom_tool_call"} {
 		if strings.Contains(early, forbidden) {
 			t.Fatalf("%s leaked before terminal:\n%s", forbidden, early)
 		}
+	}
+	if !strings.Contains(early, "response.reasoning_summary_text.delta") {
+		t.Fatalf("summary must stream before terminal:\n%s", early)
 	}
 	close(h.release)
 	h.waitClosed(t)
@@ -363,6 +390,9 @@ func TestIncrementalTextArrivesBeforeTerminal(t *testing.T) {
 	if got := streamedText(events); got != text {
 		t.Fatalf("streamed text mismatch (duplicated or missing):\n got %q\nwant %q", got, text)
 	}
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("streamed summary mismatch (duplicated or missing):\n got %q\nwant %q", got, summary)
+	}
 	if n := countType(events, "response.created"); n != 1 {
 		t.Fatalf("created events = %d", n)
 	}
@@ -370,9 +400,29 @@ func TestIncrementalTextArrivesBeforeTerminal(t *testing.T) {
 	if _, hasError := created["error"]; events[0]["type"] != "response.created" || created["id"] != "resp_up_scene3" || hasError {
 		t.Fatalf("prologue must use upstream id without error field: %#v", events[0])
 	}
-	for _, e := range events {
-		if strings.HasPrefix(stringValue(e["type"]), "response.reasoning") {
-			t.Fatalf("reasoning event streamed: %v", e["type"])
+	firstSummary, firstText := -1, -1
+	for i, e := range events {
+		switch e["type"] {
+		case "response.reasoning_summary_text.delta":
+			if firstSummary < 0 {
+				firstSummary = i
+			}
+		case "response.output_text.delta":
+			if firstText < 0 {
+				firstText = i
+			}
+		}
+	}
+	if firstSummary < 0 || firstText < 0 || firstSummary > firstText {
+		t.Fatalf("summary must be delivered before text (summary=%d text=%d)", firstSummary, firstText)
+	}
+	for kind, want := range map[string]int{
+		"response.reasoning_summary_part.added": 1,
+		"response.reasoning_summary_text.done":  1,
+		"response.reasoning_summary_part.done":  1,
+	} {
+		if n := countType(events, kind); n != want {
+			t.Fatalf("%s count=%d want %d: %v", kind, n, want, eventTypes(events))
 		}
 	}
 	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
@@ -393,22 +443,41 @@ func TestIncrementalTextArrivesBeforeTerminal(t *testing.T) {
 		if e["type"] == "response.output_text.delta" && (e["item_id"] != "msg_1" || e["output_index"] != float64(1) || e["content_index"] != float64(0)) {
 			t.Fatalf("delta routed to wrong item/part: %v", e)
 		}
+		if e["type"] == "response.output_item.added" {
+			item := objectValue(e["item"])
+			if stringValue(item["type"]) == "reasoning" {
+				if summaryAny, _ := item["summary"].([]any); len(summaryAny) != 0 {
+					t.Fatalf("reasoning added must start with empty summary: %v", e)
+				}
+			}
+		}
+		if e["type"] == "response.output_item.done" {
+			item := objectValue(e["item"])
+			if stringValue(item["type"]) == "reasoning" && item["encrypted_content"] != "enc-synthetic" {
+				t.Fatalf("reasoning done must carry upstream ciphertext: %v", e)
+			}
+		}
 	}
 }
 
-// 夹具 B（0927 第1轮）：推理 → 工具，无正文。整轮不 commit，工具在终态回放。
-func TestIncrementalToolOnlyTurnReplaysAtTerminal(t *testing.T) {
+// 夹具 B（0927 第1轮）：推理 → 工具，无正文。摘要随首个增量交付，工具整轮不 commit，
+// 只在终态回放。
+func TestIncrementalToolOnlyTurnStreamsSummaryBeforeToolAtTerminal(t *testing.T) {
+	summary := "只需要调用一次工具。"
 	call, _ := relayFixture("call_tool_only", false)
 	s := newBPStream("resp_up_tool")
-	s.reasoning("只需要调用一次工具。", 100)
+	s.reasoning(summary, 100)
 	s.tool(call, 57)
 	blocks := s.terminal()
 	h := newIncHost(chunks(blocks, len(blocks)-1))
 	h.holdAt[1] = 1
 	startIncremental(t, h, 5, relaySource())
-	h.waitFor(t, "response.in_progress")
-	if early := h.snapshot(); strings.Contains(early, "output_item") {
-		t.Fatalf("tool-only turn must not stream items before terminal:\n%s", early)
+	h.waitFor(t, "response.reasoning_summary_text.delta")
+	early := h.snapshot()
+	for _, forbidden := range []string{"function_call", "custom_tool_call", "response.completed"} {
+		if strings.Contains(early, forbidden) {
+			t.Fatalf("%s leaked before terminal:\n%s", forbidden, early)
+		}
 	}
 	close(h.release)
 	h.waitClosed(t)
@@ -417,6 +486,15 @@ func TestIncrementalToolOnlyTurnReplaysAtTerminal(t *testing.T) {
 	output, _ := final["output"].([]any)
 	if final["id"] != "resp_up_tool" || len(output) != 2 || objectValue(output[1])["type"] != "custom_tool_call" {
 		t.Fatalf("unexpected final: %s", jsonBytes(final))
+	}
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("streamed summary mismatch (duplicated or missing):\n got %q\nwant %q", got, summary)
+	}
+	if n := countType(events, "response.reasoning_summary_text.done"); n != 1 {
+		t.Fatalf("reasoning summary text.done count=%d want 1: %v", n, eventTypes(events))
+	}
+	if n := countType(events, "response.output_item.done"); n != 2 {
+		t.Fatalf("item lifecycle must close once per item, got %d: %v", n, eventTypes(events))
 	}
 }
 
@@ -440,12 +518,12 @@ func TestIncrementalByteSplitLongText(t *testing.T) {
 	}
 }
 
-// 未交付正文前工具无效 → 重生成一次；客户端 id 固定为首轮开流时的上游 id。
-func TestIncrementalRegenerateBeforeTextKeepsClientID(t *testing.T) {
+// 未交付摘要/正文前工具无效 → 重生成一次；空摘要不 commit，客户端 id 固定为首轮开流时的上游 id。
+func TestIncrementalRegenerateBeforeSummaryKeepsClientID(t *testing.T) {
 	bad, _ := relayFixture("call_bad", true)
 	good, _ := relayFixture("call_good", false)
 	first := newBPStream("resp_attempt1")
-	first.reasoning("尝试调用工具。", 10)
+	first.reasoning("", 0)
 	first.tool(bad, 4)
 	second := newBPStream("resp_attempt2")
 	second.message("重新生成后的说明。", 6)
@@ -468,6 +546,9 @@ func TestIncrementalRegenerateBeforeTextKeepsClientID(t *testing.T) {
 	}
 	if streamedText(events) != "重新生成后的说明。" {
 		t.Fatalf("text %q", streamedText(events))
+	}
+	if got := streamedSummary(events); got != "" {
+		t.Fatalf("empty summary must not deliver deltas, got %q", got)
 	}
 	if logs := strings.Join(h.logMessages(), "\n"); !strings.Contains(logs, "info:basispoints: regenerating once after invalid tool call") || !strings.Contains(logs, `"transport":"http"`) {
 		t.Fatalf("regenerate counter log missing: %s", logs)
@@ -506,11 +587,316 @@ func TestIncrementalInvalidToolAfterTextFailsWithoutRetry(t *testing.T) {
 		t.Fatalf("text duplicated or missing: %q", streamedText(events))
 	}
 	logs := strings.Join(h.logMessages(), "\n")
-	if !strings.Contains(logs, "warn:basispoints: tool call invalid after text was delivered") || strings.Contains(logs, "regenerating once") {
-		t.Fatalf("422-after-text counter log wrong: %s", logs)
+	if !strings.Contains(logs, "warn:basispoints: tool call invalid after output was delivered") || strings.Contains(logs, "regenerating once") {
+		t.Fatalf("422-after-delivery counter log wrong: %s", logs)
 	}
 	if strings.Contains(logs, "先说明") || strings.Contains(logs, "apply_patch") {
 		t.Fatalf("logs must not carry content: %s", logs)
+	}
+}
+
+// 纯摘要轮：摘要增量整轮交付一次、生命周期闭合一次，终态只补 completed。
+func TestIncrementalSummaryOnlyTurnStreamsOnce(t *testing.T) {
+	summary := "只输出推理摘要。"
+	s := newBPStream("resp_up_sum_only")
+	s.reasoning(summary, 5)
+	blocks := s.terminal()
+	h := newIncHost(chunks(blocks, len(blocks)-1))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.closeErr != nil {
+		t.Fatalf("normal close expected, got %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("streamed summary mismatch (duplicated or missing):\n got %q\nwant %q", got, summary)
+	}
+	want := "response.created,response.in_progress,response.output_item.added,response.reasoning_summary_part.added," +
+		"response.reasoning_summary_text.delta,response.reasoning_summary_text.delta,response.reasoning_summary_text.delta," +
+		"response.reasoning_summary_text.delta,response.reasoning_summary_text.delta," +
+		"response.reasoning_summary_text.done,response.reasoning_summary_part.done,response.output_item.done,response.completed"
+	if got := strings.Join(eventTypes(events), ","); got != want {
+		t.Fatalf("summary-only turn replay:\n got %s\nwant %s", got, want)
+	}
+	if countType(events, "response.output_text.delta") != 0 {
+		t.Fatalf("no message text expected: %v", eventTypes(events))
+	}
+}
+
+// 多个推理条目、每个条目多个 summary 部件：按原始下标回放，不因部件边界压缩索引。
+func TestIncrementalMultiReasoningItemsAndSummaryParts(t *testing.T) {
+	summary := "第一部分。第二部分。第二条推理。"
+	s := newBPStream("resp_up_multi_sum")
+	s.reasoningParts("rs_multi_1", []string{"第一部分。", "第二部分。"}, 2)
+	s.reasoningParts("rs_multi_2", []string{"第二条推理。"}, 2)
+	blocks := s.terminal()
+	h := newIncHost(byteChunks(blocks, 11))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("multi-part summary mismatch:\n got %q\nwant %q", got, summary)
+	}
+	for kind, want := range map[string]int{
+		"response.reasoning_summary_part.added": 3,
+		"response.reasoning_summary_text.done":  3,
+		"response.reasoning_summary_part.done":  3,
+		"response.output_item.done":             2,
+		"response.completed":                    1,
+	} {
+		if n := countType(events, kind); n != want {
+			t.Fatalf("%s count=%d want %d: %v", kind, n, want, eventTypes(events))
+		}
+	}
+	final := terminalEvent(t, events)
+	output, _ := final["output"].([]any)
+	if len(output) != 2 || objectValue(output[0])["id"] != "rs_multi_1" || objectValue(output[1])["id"] != "rs_multi_2" {
+		t.Fatalf("unexpected final output: %s", jsonBytes(output))
+	}
+}
+
+// 上游在摘要中间截断（无后续 delta/done 事件）→ 终态只补发后缀并补齐生命周期，各一次。
+func TestIncrementalSummarySuffixCompletedAtTerminal(t *testing.T) {
+	s := newBPStream("resp_up_suffix")
+	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_suffix", "summary": []any{}}})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_suffix", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_suffix", "summary_index": 0, "delta": "前半段"})
+	item := map[string]any{"type": "reasoning", "id": "rs_suffix", "summary": []any{map[string]any{"type": "summary_text", "text": "前半段后半段"}}, "encrypted_content": "enc-synthetic"}
+	blocks := s.terminal(item)
+	h := newIncHost(chunks(blocks, len(blocks)-1))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if got := streamedSummary(events); got != "前半段后半段" {
+		t.Fatalf("suffix summary mismatch (duplicated or missing):\n got %q", got)
+	}
+	for kind, want := range map[string]int{
+		"response.reasoning_summary_text.delta": 2,
+		"response.reasoning_summary_text.done":  1,
+		"response.reasoning_summary_part.done":  1,
+		"response.output_item.done":             1,
+		"response.completed":                    1,
+	} {
+		if n := countType(events, kind); n != want {
+			t.Fatalf("%s count=%d want %d: %v", kind, n, want, eventTypes(events))
+		}
+	}
+}
+
+// item.done 与终态密文不一致 → invalid_upstream_stream；不一致的密文不得交付。
+func TestIncrementalSummaryCiphertextMismatchFails(t *testing.T) {
+	s := newBPStream("resp_up_cipher")
+	s.reasoning("密文校验。", 2)
+	changed := cloneObject(objectValue(s.output[0]))
+	changed["encrypted_content"] = "enc-terminal-different"
+	blocks := s.terminal(changed)
+	h := newIncHost(chunks(blocks, 5))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.closeErr != nil {
+		t.Fatalf("request-scoped failure must close normally: %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
+		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	}
+	var code any
+	for _, e := range events {
+		if e["type"] == "response.failed" {
+			code = objectValue(objectValue(e["response"])["error"])["code"]
+		}
+	}
+	if code != "invalid_upstream_stream" {
+		t.Fatalf("failed code %v", code)
+	}
+	if strings.Contains(h.snapshot(), "enc-terminal-different") {
+		t.Fatal("mismatched ciphertext leaked to client")
+	}
+	if got := streamedSummary(events); got != "密文校验。" {
+		t.Fatalf("summary delivered once before failure: %q", got)
+	}
+}
+
+// 同一下标先出现推理再出现消息（或相反）→ invalid_upstream_stream；冲突内容不交付。
+func TestIncrementalOutputIndexConflictFails(t *testing.T) {
+	run := func(t *testing.T, s *bpStream, forbidden string, wantText, wantSummary string) {
+		t.Helper()
+		blocks := s.terminal()
+		h := newIncHost(chunks(blocks, 5))
+		startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+		h.waitClosed(t)
+		events := clientStreamEvents(t, []byte(h.snapshot()))
+		if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
+			t.Fatalf("want response.failed only, got %v", eventTypes(events))
+		}
+		if got := streamedText(events); got != wantText {
+			t.Fatalf("delivered text %q want %q", got, wantText)
+		}
+		if got := streamedSummary(events); got != wantSummary {
+			t.Fatalf("delivered summary %q want %q", got, wantSummary)
+		}
+		if strings.Contains(h.snapshot(), forbidden) {
+			t.Fatalf("conflicting item %q leaked to client", forbidden)
+		}
+	}
+
+	t.Run("reasoning_then_message", func(t *testing.T) {
+		s := newBPStream("resp_up_conflict_a")
+		s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_conf_a", "summary": []any{}}})
+		s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_conf_a", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+		s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_conf_a", "summary_index": 0, "delta": "先有推理。"})
+		s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "message", "id": "msg_conf_a", "role": "assistant", "status": "in_progress", "content": []any{}}})
+		run(t, s, "msg_conf_a", "", "先有推理。")
+	})
+
+	t.Run("message_then_reasoning", func(t *testing.T) {
+		s := newBPStream("resp_up_conflict_b")
+		s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "message", "id": "msg_conf_b", "role": "assistant", "status": "in_progress", "content": []any{}}})
+		s.add("response.content_part.added", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg_conf_b", "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
+		s.add("response.output_text.delta", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg_conf_b", "delta": "正文。"})
+		s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_conf_b", "summary": []any{}}})
+		run(t, s, "rs_conf_b", "正文。", "")
+	})
+}
+
+// summary 生命周期重复（同一部件再次 added）→ invalid_upstream_stream。
+func TestIncrementalDuplicateSummaryLifecycleFails(t *testing.T) {
+	s := newBPStream("resp_up_dup")
+	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_dup", "summary": []any{}}})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_dup", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_dup", "summary_index": 0, "delta": "重复"})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_dup", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+	blocks := s.terminal()
+	h := newIncHost(chunks(blocks, 5))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
+		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	}
+	if got := streamedSummary(events); got != "重复" {
+		t.Fatalf("summary must be delivered once before failure: %q", got)
+	}
+}
+
+// 摘要已交付后工具无效 → response.failed，不重生成（与正文已交付同样的边界）。
+func TestIncrementalToolFailureAfterSummaryFailsWithoutRetry(t *testing.T) {
+	bad, _ := relayFixture("call_bad_after_sum", true)
+	s := newBPStream("resp_up_bad_after_sum")
+	s.reasoning("先摘要再失败。", 4)
+	s.tool(bad, 4)
+	h := newIncHost(chunks(s.terminal(), 4))
+	startIncremental(t, h, 5, relaySource())
+	h.waitClosed(t)
+	if h.nextID != 1 {
+		t.Fatalf("must not regenerate after summary was delivered, attempts=%d", h.nextID)
+	}
+	if h.closeErr != nil {
+		t.Fatalf("request-scoped failure must close normally: %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.completed") != 0 || countType(events, "response.failed") != 1 {
+		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	}
+	var failed map[string]any
+	for _, e := range events {
+		if e["type"] == "response.failed" {
+			failed = objectValue(objectValue(e["response"])["error"])
+		}
+	}
+	if failed["code"] != "invalid_tool_call" {
+		t.Fatalf("failed code %v", failed["code"])
+	}
+	if got := streamedSummary(events); got != "先摘要再失败。" {
+		t.Fatalf("summary duplicated or missing: %q", got)
+	}
+	logs := strings.Join(h.logMessages(), "\n")
+	if !strings.Contains(logs, "warn:basispoints: tool call invalid after output was delivered") || strings.Contains(logs, "regenerating once") {
+		t.Fatalf("post-delivery counter log wrong: %s", logs)
+	}
+}
+
+// 摘要已交付后上游流内报 429 → 带 error 关闭（交给 CPA 冷却/换号），不发 response.failed。
+func TestIncrementalRateLimitAfterSummaryClosesWithError(t *testing.T) {
+	s := newBPStream("resp_up_429_sum")
+	s.reasoning("部分摘要。", 4)
+	blocks := s.blocks[:indexOfType(s.blocks, "response.reasoning_summary_text.delta", 2)+1]
+	var b strings.Builder
+	writeSSE(&b, "response.failed", map[string]any{"type": "response.failed", "response": map[string]any{"id": "resp_up_429_sum", "status": "failed", "error": map[string]any{"code": "rate_limit_exceeded", "message": "slow down"}}, "status": 429})
+	blocks = append(append([]string{}, blocks...), b.String())
+	h := newIncHost(chunks(blocks, len(blocks)-1))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.closeErr == nil {
+		t.Fatal("credential/rate-limit failure after summary must close with error")
+	}
+	if strings.Contains(h.snapshot(), "response.failed") {
+		t.Fatal("must not emit response.failed for non-request-scoped failure")
+	}
+	// 带 error 关闭没有 [DONE] 终止符，直接核对原始快照里的部分摘要。
+	raw := h.snapshot()
+	if n := strings.Count(raw, "event: response.reasoning_summary_text.delta"); n != 2 {
+		t.Fatalf("partial summary before 429: %d deltas\n%s", n, raw)
+	}
+	if strings.Contains(raw, "response.reasoning_summary_text.done") {
+		t.Fatal("truncated stream must not close the summary lifecycle")
+	}
+}
+
+// 摘要交付时 emit 失败（客户端断开）→ 中止读取，不再发起后续 stream_read。
+func TestIncrementalSummaryEmitFailureStopsReading(t *testing.T) {
+	s := newBPStream("resp_up_sum_gone")
+	s.reasoning("客户端断开摘要。", 7)
+	blocks := s.terminal()
+	h := newIncHost(chunks(blocks, 3, 5, 7))
+	h.failAfter = 1
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	h.mu.Lock()
+	reads, closeErr := h.reads, h.closeErr
+	h.mu.Unlock()
+	if reads != 2 {
+		t.Fatalf("reads=%d after summary emit failure, want 2", reads)
+	}
+	if closeErr != nil {
+		t.Fatalf("client disconnect closes without error, got %v", closeErr)
+	}
+}
+
+// 上游完全没有推理事件、推理条目只在终态出现 → 终态回放完整摘要生命周期一次，正文不重复。
+func TestIncrementalReasoningMissingEventsReplayedAtTerminal(t *testing.T) {
+	text := "正文照常增量。"
+	msgID := "msg_missing"
+	msg := map[string]any{"type": "message", "id": msgID, "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
+	s := newBPStream("resp_up_missing")
+	s.add("response.output_item.added", map[string]any{"output_index": 1, "item": map[string]any{"type": "message", "id": msgID, "role": "assistant", "status": "in_progress", "content": []any{}}})
+	s.add("response.content_part.added", map[string]any{"output_index": 1, "content_index": 0, "item_id": msgID, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
+	s.add("response.output_text.delta", map[string]any{"output_index": 1, "content_index": 0, "item_id": msgID, "delta": text})
+	s.add("response.output_text.done", map[string]any{"output_index": 1, "content_index": 0, "item_id": msgID, "text": text})
+	s.add("response.content_part.done", map[string]any{"output_index": 1, "content_index": 0, "item_id": msgID, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}}})
+	s.add("response.output_item.done", map[string]any{"output_index": 1, "item": msg})
+	reasoning := map[string]any{"type": "reasoning", "id": "rs_missing", "summary": []any{map[string]any{"type": "summary_text", "text": "只在终态出现的推理。"}}, "encrypted_content": "enc-missing"}
+	blocks := s.terminal(reasoning, msg)
+	h := newIncHost(chunks(blocks, 4))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if got := streamedText(events); got != text {
+		t.Fatalf("text duplicated or missing: %q", got)
+	}
+	if got := streamedSummary(events); got != "只在终态出现的推理。" {
+		t.Fatalf("terminal-only reasoning summary: %q", got)
+	}
+	for kind, want := range map[string]int{
+		"response.reasoning_summary_part.added": 1,
+		"response.reasoning_summary_text.done":  1,
+		"response.reasoning_summary_part.done":  1,
+		"response.output_item.done":             2,
+		"response.completed":                    1,
+	} {
+		if n := countType(events, kind); n != want {
+			t.Fatalf("%s count=%d want %d: %v", kind, n, want, eventTypes(events))
+		}
 	}
 }
 
@@ -561,9 +947,8 @@ func TestIncrementalFinalMismatchFails(t *testing.T) {
 	if code != "invalid_upstream_stream" && code != "invalid_upstream_response" {
 		t.Fatalf("failed code %v (events %v)", code, eventTypes(events))
 	}
-	if rememberedNativeCall("call_mismatch_valid") != nil {
-		t.Fatal("inconsistent terminal must be rejected before tool identities are cached")
-	}
+	// 不一致的终态须在触碰工具身份前被拒绝：同 call_id 的历史只按客户端条目自身冷重建。
+	assertNoReplayableFailure(t, "call_mismatch_valid", "apply_patch", "client-owned input")
 }
 
 // 上游未给 done 事件、终态正文比已交付更长：Service 路径须补发未交付后缀。
@@ -948,6 +1333,119 @@ func TestKeepFinalReplaysOnlyUndeliveredSuffix(t *testing.T) {
 	}
 }
 
+// keepFinal：摘要 commit 后终态只补发未交付的摘要后缀，并补齐未交付的生命周期事件。
+func TestKeepFinalReplaysUndeliveredSummarySuffix(t *testing.T) {
+	var forwarded []map[string]any
+	d := newStreamDelivery(nil, func(meta map[string]any, frames []map[string]any) error {
+		forwarded = append(forwarded, frames...)
+		return nil
+	})
+	s := newBPStream("resp_k_sum")
+	s.reasoning("前半段后半段", 2)
+	// 只喂到第一个 delta（commit，交付「前半段」）
+	upto := indexOfType(s.blocks, "response.reasoning_summary_text.delta", 1)
+	dec := newSSEDecoder()
+	if err := dec.feed([]byte(strings.Join(s.blocks[:upto+1], "")), d.consume); err != nil {
+		t.Fatal(err)
+	}
+	if !d.committed || streamedSummary(forwarded) != "前半段" {
+		t.Fatalf("commit state %v summary %q", d.committed, streamedSummary(forwarded))
+	}
+	final := map[string]any{"id": "resp_k_sum", "status": "completed", "output": s.output}
+	if err := d.validateFinal(final); err != nil {
+		t.Fatal(err)
+	}
+	events := syntheticEventsWithReasoningSummary(final, false)
+	var kept []string
+	var suffix string
+	for i := range events {
+		if d.keepFinal(&events[i]) {
+			kept = append(kept, events[i].name)
+			if events[i].name == "response.reasoning_summary_text.delta" {
+				suffix, _ = events[i].value["delta"].(string)
+			}
+		}
+	}
+	if suffix != "后半段" {
+		t.Fatalf("suffix %q", suffix)
+	}
+	want := "response.reasoning_summary_text.delta,response.reasoning_summary_text.done,response.reasoning_summary_part.done,response.output_item.done,response.completed"
+	if strings.Join(kept, ",") != want {
+		t.Fatalf("kept %s", strings.Join(kept, ","))
+	}
+}
+
+// 空摘要不 commit；直到首个非空消息正文增量才整批交付（含此前未交付的推理生命周期）。
+func TestStreamDeliveryEmptySummaryDoesNotCommitUntilText(t *testing.T) {
+	var forwarded []map[string]any
+	d := newStreamDelivery(nil, func(meta map[string]any, frames []map[string]any) error {
+		forwarded = append(forwarded, frames...)
+		return nil
+	})
+	s := newBPStream("resp_empty_sum")
+	s.reasoning("", 0)
+	s.message("正文。", 1)
+	firstDelta := indexOfType(s.blocks, "response.output_text.delta", 1)
+	dec := newSSEDecoder()
+	if err := dec.feed([]byte(strings.Join(s.blocks[:firstDelta], "")), d.consume); err != nil {
+		t.Fatal(err)
+	}
+	if d.committed || len(forwarded) != 0 {
+		t.Fatalf("empty summary must not commit: committed=%v forwarded=%d", d.committed, len(forwarded))
+	}
+	if err := dec.feed([]byte(s.blocks[firstDelta]), d.consume); err != nil {
+		t.Fatal(err)
+	}
+	if !d.committed || len(forwarded) != 8 {
+		t.Fatalf("message text must commit with 8 pending frames: committed=%v frames=%d", d.committed, len(forwarded))
+	}
+	if got := streamedSummary(forwarded); got != "" {
+		t.Fatalf("empty summary delivered deltas: %q", got)
+	}
+	if streamedText(forwarded) != "正文。" {
+		t.Fatalf("text %q", streamedText(forwarded))
+	}
+}
+
+// reasoning 摘要增量只由专用生成器产生：默认回放保持冻结的 legacy 形状（added 携带完整 summary）。
+func TestReasoningSummaryEventsOnlyInDedicatedGenerator(t *testing.T) {
+	item := map[string]any{"type": "reasoning", "id": "rs_gen", "summary": []any{map[string]any{"type": "summary_text", "text": "摘要正文。"}}, "encrypted_content": "enc-gen"}
+	response := map[string]any{"id": "r", "status": "completed", "output": []any{item}}
+	var legacy []string
+	for _, e := range syntheticEvents(response, false) {
+		legacy = append(legacy, e.name)
+		if strings.HasPrefix(e.name, "response.reasoning_summary_") {
+			t.Fatalf("legacy replay must not emit %s", e.name)
+		}
+		if e.name == "response.output_item.added" {
+			if summaryAny, _ := objectValue(e.value["item"])["summary"].([]any); len(summaryAny) != 1 {
+				t.Fatalf("legacy added must carry full summary: %v", e.value)
+			}
+		}
+	}
+	if want := "response.output_item.added,response.output_item.done,response.completed"; strings.Join(legacy, ",") != want {
+		t.Fatalf("legacy sequence %s", strings.Join(legacy, ","))
+	}
+	var dedicated []string
+	for _, e := range syntheticEventsWithReasoningSummary(response, false) {
+		dedicated = append(dedicated, e.name)
+		switch e.name {
+		case "response.output_item.added":
+			if summaryAny, _ := objectValue(e.value["item"])["summary"].([]any); len(summaryAny) != 0 {
+				t.Fatalf("dedicated added must start with empty summary: %v", e.value)
+			}
+		case "response.output_item.done":
+			if objectValue(e.value["item"])["encrypted_content"] != "enc-gen" {
+				t.Fatalf("dedicated done must carry full item: %v", e.value)
+			}
+		}
+	}
+	want := "response.output_item.added,response.reasoning_summary_part.added,response.reasoning_summary_text.delta,response.reasoning_summary_text.done,response.reasoning_summary_part.done,response.output_item.done,response.completed"
+	if strings.Join(dedicated, ",") != want {
+		t.Fatalf("dedicated sequence:\n got %s\nwant %s", strings.Join(dedicated, ","), want)
+	}
+}
+
 // 下游不读（宿主队列满、增量 emit 阻塞在会话锁内）时 shutdown 仍有界。
 func TestIncrementalShutdownBoundedWhenDeliveryStalls(t *testing.T) {
 	oldWait, oldGrace := shutdownWait, shutdownForceGrace
@@ -1112,5 +1610,481 @@ func TestStreamSessionAbortOwnsCloseReason(t *testing.T) {
 	defer mu.Unlock()
 	if closes != 1 || !strings.Contains(fmt.Sprint(closeErr), "timed out") || strings.Contains(string(emitted), "response.completed") {
 		t.Fatalf("closes=%d err=%v completed=%t", closes, closeErr, strings.Contains(string(emitted), "response.completed"))
+	}
+}
+
+// ---- A6 一致性：added 已交付密文冲突拒绝、开场预填字段规范化 ----
+
+// added 已交付非空密文 A，done 与终态改为 B：已交付已知内容冲突 → response.failed，
+// B 不外发、不重生成、不 completed。
+func TestIncrementalAddedCiphertextConflictFailsAtDone(t *testing.T) {
+	summary := "已交付的摘要。"
+	s := newBPStream("resp_up_added_cipher")
+	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_added_cipher", "summary": []any{}, "encrypted_content": "enc-added-A"}})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "delta": summary})
+	s.add("response.reasoning_summary_text.done", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "text": summary})
+	s.add("response.reasoning_summary_part.done", map[string]any{"output_index": 0, "item_id": "rs_added_cipher", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
+	changed := map[string]any{"type": "reasoning", "id": "rs_added_cipher", "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "enc-done-B"}
+	s.add("response.output_item.done", map[string]any{"output_index": 0, "item": changed})
+	blocks := s.terminal(changed)
+	cut := indexOfType(blocks, "response.reasoning_summary_text.delta", 1) + 1
+	h := newIncHost(chunks(blocks, cut))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.nextID != 1 {
+		t.Fatalf("must not regenerate, attempts=%d", h.nextID)
+	}
+	if h.closeErr != nil {
+		t.Fatalf("request-scoped failure must close normally: %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
+		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	}
+	var code any
+	for _, e := range events {
+		if e["type"] == "response.failed" {
+			code = objectValue(objectValue(e["response"])["error"])["code"]
+		}
+	}
+	if code != "invalid_upstream_stream" {
+		t.Fatalf("failed code %v", code)
+	}
+	raw := h.snapshot()
+	if !strings.Contains(raw, "enc-added-A") {
+		t.Fatal("delivered ciphertext A missing before the conflict")
+	}
+	if strings.Contains(raw, "enc-done-B") {
+		t.Fatal("conflicting ciphertext leaked to client")
+	}
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("summary must be delivered exactly once before failure: %q", got)
+	}
+	if n := countType(events, "response.reasoning_summary_text.done"); n != 1 {
+		t.Fatalf("lifecycle before the conflict must complete once, got %d", n)
+	}
+}
+
+// added 已交付非空密文 A，没有 item.done，终态直接改为 B：同一冲突在终态核对时失败。
+func TestIncrementalAddedCiphertextConflictFailsAtFinal(t *testing.T) {
+	summary := "已交付的摘要。"
+	s := newBPStream("resp_up_added_cipher_final")
+	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_added_cipher_final", "summary": []any{}, "encrypted_content": "enc-added-A"}})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_added_cipher_final", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_added_cipher_final", "summary_index": 0, "delta": summary})
+	changed := map[string]any{"type": "reasoning", "id": "rs_added_cipher_final", "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "enc-final-B"}
+	blocks := s.terminal(changed)
+	cut := indexOfType(blocks, "response.reasoning_summary_text.delta", 1) + 1
+	h := newIncHost(chunks(blocks, cut))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.nextID != 1 {
+		t.Fatalf("must not regenerate, attempts=%d", h.nextID)
+	}
+	if h.closeErr != nil {
+		t.Fatalf("request-scoped failure must close normally: %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
+		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	}
+	if strings.Contains(h.snapshot(), "enc-final-B") {
+		t.Fatal("conflicting ciphertext leaked to client")
+	}
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("summary must be delivered exactly once before failure: %q", got)
+	}
+}
+
+// added 密文缺失/null/空（都视为无已知值）时，done/终态可以合法补全非空密文，正常完成一次。
+func TestIncrementalAddedEmptyCiphertextCompletedAtDoneOrFinal(t *testing.T) {
+	variants := []struct {
+		name string
+		set  func(item map[string]any)
+	}{
+		{"missing", func(map[string]any) {}},
+		{"null", func(item map[string]any) { item["encrypted_content"] = nil }},
+		{"empty", func(item map[string]any) { item["encrypted_content"] = "" }},
+	}
+	for _, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			summary := "补全的摘要。"
+			id := "rs_enc_" + variant.name
+			s := newBPStream("resp_up_enc_" + variant.name)
+			addedItem := map[string]any{"type": "reasoning", "id": id, "summary": []any{}}
+			variant.set(addedItem)
+			s.add("response.output_item.added", map[string]any{"output_index": 0, "item": addedItem})
+			s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": ""}})
+			s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "delta": summary})
+			s.add("response.reasoning_summary_text.done", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "text": summary})
+			s.add("response.reasoning_summary_part.done", map[string]any{"output_index": 0, "item_id": id, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
+			item := map[string]any{"type": "reasoning", "id": id, "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "enc-complete"}
+			s.add("response.output_item.done", map[string]any{"output_index": 0, "item": item})
+			blocks := s.terminal(item)
+			cut := indexOfType(blocks, "response.reasoning_summary_text.delta", 1) + 1
+			h := newIncHost(chunks(blocks, cut))
+			startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+			h.waitClosed(t)
+			if h.closeErr != nil {
+				t.Fatalf("normal close expected, got %v", h.closeErr)
+			}
+			events := clientStreamEvents(t, []byte(h.snapshot()))
+			if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+				t.Fatalf("want completed once, got %v", eventTypes(events))
+			}
+			if got := streamedSummary(events); got != summary {
+				t.Fatalf("summary duplicated or missing: %q", got)
+			}
+			doneSeen := false
+			for _, e := range events {
+				if e["type"] == "response.output_item.done" {
+					if item := objectValue(e["item"]); stringValue(item["type"]) == "reasoning" && item["encrypted_content"] == "enc-complete" {
+						doneSeen = true
+					}
+				}
+			}
+			if !doneSeen {
+				t.Fatalf("done must supply the completed ciphertext: %v", eventTypes(events))
+			}
+			for kind, want := range map[string]int{
+				"response.reasoning_summary_part.added": 1,
+				"response.reasoning_summary_text.done":  1,
+				"response.reasoning_summary_part.done":  1,
+				"response.output_item.done":             1,
+				"response.completed":                    1,
+			} {
+				if n := countType(events, kind); n != want {
+					t.Fatalf("%s count=%d want %d: %v", kind, n, want, eventTypes(events))
+				}
+			}
+		})
+	}
+}
+
+// HTTP 已提交增量：added/part.added 的预填摘要文本被规范化为空开场（身份/密文保留），
+// 正文只经 delta 累计一次，生命周期恰好一次。
+func TestIncrementalReasoningPrefilledOpeningFieldsNormalized(t *testing.T) {
+	summary := "第一段第二段"
+	s := newBPStream("resp_up_prefill")
+	s.add("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "reasoning", "id": "rs_prefill", "summary": []any{map[string]any{"type": "summary_text", "text": "预填摘要不得外发"}}, "encrypted_content": "enc-prefill"}})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 0, "item_id": "rs_prefill", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": "预填部件不得外发"}})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_prefill", "summary_index": 0, "delta": "第一段"})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 0, "item_id": "rs_prefill", "summary_index": 0, "delta": "第二段"})
+	s.add("response.reasoning_summary_text.done", map[string]any{"output_index": 0, "item_id": "rs_prefill", "summary_index": 0, "text": summary})
+	s.add("response.reasoning_summary_part.done", map[string]any{"output_index": 0, "item_id": "rs_prefill", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
+	item := map[string]any{"type": "reasoning", "id": "rs_prefill", "summary": []any{map[string]any{"type": "summary_text", "text": summary}}, "encrypted_content": "enc-prefill"}
+	s.add("response.output_item.done", map[string]any{"output_index": 0, "item": item})
+	blocks := s.terminal(item)
+	cut := indexOfType(blocks, "response.reasoning_summary_text.delta", 1) + 1
+	h := newIncHost(chunks(blocks, cut))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.closeErr != nil {
+		t.Fatalf("normal close expected, got %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("summary duplicated or missing (prefill leaked into display?):\n got %q\nwant %q", got, summary)
+	}
+	var addedSeen, partSeen bool
+	for _, e := range events {
+		switch e["type"] {
+		case "response.output_item.added":
+			opened := objectValue(e["item"])
+			if stringValue(opened["type"]) != "reasoning" {
+				continue
+			}
+			addedSeen = true
+			if summaryAny, _ := opened["summary"].([]any); len(summaryAny) != 0 {
+				t.Fatalf("reasoning added must start with empty summary: %v", e)
+			}
+			if opened["id"] != "rs_prefill" || opened["encrypted_content"] != "enc-prefill" {
+				t.Fatalf("identity/ciphertext must be preserved in opening: %v", e)
+			}
+		case "response.reasoning_summary_part.added":
+			partSeen = true
+			part := objectValue(e["part"])
+			if stringValue(part["type"]) != "summary_text" || part["text"] != "" {
+				t.Fatalf("summary part must open with empty text: %v", e)
+			}
+		}
+	}
+	if !addedSeen || !partSeen {
+		t.Fatalf("opening events missing: %v", eventTypes(events))
+	}
+	raw := h.snapshot()
+	if strings.Contains(raw, "预填摘要不得外发") || strings.Contains(raw, "预填部件不得外发") {
+		t.Fatal("prefilled opening text leaked to client")
+	}
+	for kind, want := range map[string]int{
+		"response.output_item.added":            1,
+		"response.reasoning_summary_part.added": 1,
+		"response.reasoning_summary_text.done":  1,
+		"response.reasoning_summary_part.done":  1,
+		"response.output_item.done":             1,
+		"response.completed":                    1,
+	} {
+		if n := countType(events, kind); n != want {
+			t.Fatalf("%s count=%d want %d: %v", kind, n, want, eventTypes(events))
+		}
+	}
+}
+
+// 正文先 commit、随后才出现带预填的 reasoning 开场：归一化同样生效，摘要只交付一次。
+func TestIncrementalMessageCommitThenReasoningPrefilledNormalized(t *testing.T) {
+	summary := "迟到的摘要。"
+	text := "先到的正文。"
+	s := newBPStream("resp_up_text_then_reason")
+	s.message(text, 2)
+	s.add("response.output_item.added", map[string]any{"output_index": 1, "item": map[string]any{"type": "reasoning", "id": "rs_late", "summary": []any{map[string]any{"type": "summary_text", "text": "迟到预填摘要"}}}})
+	s.add("response.reasoning_summary_part.added", map[string]any{"output_index": 1, "item_id": "rs_late", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": "迟到预填部件"}})
+	s.add("response.reasoning_summary_text.delta", map[string]any{"output_index": 1, "item_id": "rs_late", "summary_index": 0, "delta": summary})
+	s.add("response.reasoning_summary_text.done", map[string]any{"output_index": 1, "item_id": "rs_late", "summary_index": 0, "text": summary})
+	s.add("response.reasoning_summary_part.done", map[string]any{"output_index": 1, "item_id": "rs_late", "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": summary}})
+	item := map[string]any{"type": "reasoning", "id": "rs_late", "summary": []any{map[string]any{"type": "summary_text", "text": summary}}}
+	s.add("response.output_item.done", map[string]any{"output_index": 1, "item": item})
+	s.output = append(s.output, item)
+	blocks := s.terminal()
+	cut := indexOfType(blocks, "response.output_text.delta", 1) + 1
+	h := newIncHost(chunks(blocks, cut))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.closeErr != nil {
+		t.Fatalf("normal close expected, got %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if got := streamedText(events); got != text {
+		t.Fatalf("text duplicated or missing: %q", got)
+	}
+	if got := streamedSummary(events); got != summary {
+		t.Fatalf("late reasoning summary duplicated or missing: %q", got)
+	}
+	var addedSeen, partSeen bool
+	for _, e := range events {
+		switch e["type"] {
+		case "response.output_item.added":
+			opened := objectValue(e["item"])
+			if stringValue(opened["type"]) != "reasoning" {
+				continue
+			}
+			addedSeen = true
+			if summaryAny, _ := opened["summary"].([]any); len(summaryAny) != 0 {
+				t.Fatalf("late reasoning added must start with empty summary: %v", e)
+			}
+		case "response.reasoning_summary_part.added":
+			partSeen = true
+			part := objectValue(e["part"])
+			if stringValue(part["type"]) != "summary_text" || part["text"] != "" {
+				t.Fatalf("late summary part must open with empty text: %v", e)
+			}
+		}
+	}
+	if !addedSeen || !partSeen {
+		t.Fatalf("late reasoning opening events missing: %v", eventTypes(events))
+	}
+	raw := h.snapshot()
+	if strings.Contains(raw, "迟到预填摘要") || strings.Contains(raw, "迟到预填部件") {
+		t.Fatal("prefilled late opening text leaked to client")
+	}
+	for kind, want := range map[string]int{
+		"response.output_item.added":            2,
+		"response.output_item.done":             2,
+		"response.reasoning_summary_part.added": 1,
+		"response.completed":                    1,
+	} {
+		if n := countType(events, kind); n != want {
+			t.Fatalf("%s count=%d want %d: %v", kind, n, want, eventTypes(events))
+		}
+	}
+}
+
+// ---- owner 复核修订的常驻回归：摘要增量提交前提缺失的安全回退与按非空内容记交付 ----
+
+// 缺 response.reasoning_summary_part.added（上游违反开启顺序）：未提交路径不交付摘要增量、
+// 不报流内错误，整轮退回终态完整回放（legacy 形状的 reasoning item 携带完整摘要），
+// 汇总的两个交付口径保持 false 且以 completed 结束。
+func TestIncrementalMissingSummaryPartFallsBackToTerminalReplay(t *testing.T) {
+	s := newBPStream("resp_missing_part")
+	s.reasoning("summary fallback", 1)
+	var blocks []string
+	for _, b := range s.terminal() {
+		if strings.HasPrefix(b, "event: response.reasoning_summary_part.added\n") {
+			continue
+		}
+		blocks = append(blocks, b)
+	}
+	h := newIncHost(chunks(blocks, 4))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	if h.closeErr != nil {
+		t.Fatalf("fallback must close normally, got %v", h.closeErr)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+		t.Fatalf("missing precommit part must fall back to terminal replay, got %v", eventTypes(events))
+	}
+	if countType(events, "response.reasoning_summary_text.delta") != 0 || streamedSummary(events) != "" {
+		t.Fatal("uncommitted fallback must not deliver summary deltas")
+	}
+	if !strings.Contains(h.snapshot(), "summary fallback") {
+		t.Fatal("terminal replay must carry the full summary")
+	}
+	rec := h.waitSummary(t)
+	if rec.SummaryCommitted || rec.TextCommitted || rec.Delivery != "incremental" || rec.Exit != "completed" {
+		t.Fatalf("fallback summary wrong: %+v", rec)
+	}
+}
+
+// 缺 reasoning 的 response.output_item.added：同样的未提交安全回退，delta 的后到事件不能
+// 补齐缺失的开场。
+func TestIncrementalMissingReasoningItemFallsBackToTerminalReplay(t *testing.T) {
+	s := newBPStream("resp_missing_item")
+	s.reasoning("hidden item summary", 1)
+	var blocks []string
+	for _, b := range s.terminal() {
+		if strings.HasPrefix(b, "event: response.output_item.added\n") && strings.Contains(b, `"reasoning"`) {
+			continue
+		}
+		blocks = append(blocks, b)
+	}
+	h := newIncHost(chunks(blocks, 4))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+		t.Fatalf("missing reasoning item must fall back to terminal replay, got %v", eventTypes(events))
+	}
+	if countType(events, "response.reasoning_summary_text.delta") != 0 || !strings.Contains(h.snapshot(), "hidden item summary") {
+		t.Fatal("terminal replay must carry the full summary without deltas")
+	}
+	rec := h.waitSummary(t)
+	if rec.SummaryCommitted || rec.TextCommitted || rec.Exit != "completed" {
+		t.Fatalf("fallback summary wrong: %+v", rec)
+	}
+}
+
+// 缺 part.added 的摘要之后跟随正文与工具的混合回合：整轮（摘要、正文、工具）经终态完整
+// 回放交付，正文恰好一次、后部工具照常转换，提交前的冲突不触发重新生成。
+func TestIncrementalMissingSummaryPartMixedTurnReplaysAtTerminal(t *testing.T) {
+	good, _ := relayFixture("call_missing_part_mixed", false)
+	s := newBPStream("resp_missing_part_mixed")
+	s.reasoning("mixed summary", 1)
+	s.message("混合回合正文。", 3)
+	s.tool(good, 2)
+	var blocks []string
+	for _, b := range s.terminal() {
+		if strings.HasPrefix(b, "event: response.reasoning_summary_part.added\n") {
+			continue
+		}
+		blocks = append(blocks, b)
+	}
+	h := newIncHost(chunks(blocks, 4))
+	startIncremental(t, h, 5, relaySource())
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+		t.Fatalf("mixed turn must complete: %v", eventTypes(events))
+	}
+	if got := streamedText(events); got != "混合回合正文。" || countType(events, "response.output_text.delta") != 1 {
+		t.Fatalf("text must be replayed exactly once at terminal: %q", got)
+	}
+	if countType(events, "response.reasoning_summary_text.delta") != 0 || streamedSummary(events) != "" {
+		t.Fatal("uncommitted fallback must not deliver summary deltas")
+	}
+	if !strings.Contains(h.snapshot(), "mixed summary") || !strings.Contains(h.snapshot(), "Begin Patch") {
+		t.Fatal("terminal replay must carry the full summary and the client tool call")
+	}
+	rec := h.waitSummary(t)
+	if rec.TextCommitted || rec.SummaryCommitted || rec.Exit != "completed" || rec.First != relayLegacy || rec.Final != relayLegacy {
+		t.Fatalf("mixed fallback summary wrong: %+v", rec)
+	}
+}
+
+// buffered 边界：暂不交付期间摘要缺 part.added 属于流内协议冲突，整轮直接失败、不重新生成、
+// 不对外交付任何增量（与终态与缓冲批不一致的处理一致）。
+func TestBufferedMissingSummaryPartFailsWithoutRegeneration(t *testing.T) {
+	s := newBPStream("resp_buf_missing_part")
+	s.reasoning("strict summary", 1)
+	var blocks []string
+	for _, b := range s.terminal() {
+		if strings.HasPrefix(b, "event: response.reasoning_summary_part.added\n") {
+			continue
+		}
+		blocks = append(blocks, b)
+	}
+	h := newIncHost(chunks(blocks, 3))
+	startBuffered(t, h, 5, relaySource())
+	h.waitClosed(t)
+	if h.nextID != 1 {
+		t.Fatalf("buffered stream conflict must not be regenerated, attempts=%d", h.nextID)
+	}
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if streamedText(events) != "" || countType(events, "response.failed") != 1 || countType(events, "response.completed") != 0 {
+		t.Fatalf("want response.failed only, got %v", eventTypes(events))
+	}
+	if !strings.Contains(h.snapshot(), "invalid_upstream_stream") || streamedSummary(events) != "" {
+		t.Fatal("buffered conflict must surface as invalid_upstream_stream without summary deltas")
+	}
+	rec := h.waitSummary(t)
+	if rec.Exit != "failed" || rec.TextCommitted || rec.SummaryCommitted {
+		t.Fatalf("buffered failure summary wrong: %+v", rec)
+	}
+}
+
+// 空摘要增量不构成摘要交付：注入 0 长度 summary delta 后正文回合提交，summary_committed
+// 必须保持 false、text_committed 为 true；空 delta 事件本身仍合法交付。
+func TestIncrementalEmptySummaryDeltaDoesNotMarkSummaryCommitted(t *testing.T) {
+	s := newBPStream("resp_empty_summary_delta")
+	s.reasoning("", 0)
+	s.message("text", 1)
+	var blocks []string
+	for _, b := range s.terminal() {
+		blocks = append(blocks, b)
+		if strings.HasPrefix(b, "event: response.reasoning_summary_part.added\n") {
+			blocks = append(blocks, "event: response.reasoning_summary_text.delta\ndata: "+string(jsonBytes(map[string]any{"type": "response.reasoning_summary_text.delta", "output_index": 0, "summary_index": 0, "item_id": "rs_0", "delta": ""}))+"\n\n")
+		}
+	}
+	h := newIncHost(chunks(blocks, 4))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+		t.Fatalf("stream invalid: %v", eventTypes(events))
+	}
+	if streamedText(events) != "text" {
+		t.Fatalf("text %q", streamedText(events))
+	}
+	rec := h.waitSummary(t)
+	if rec.SummaryCommitted || !rec.TextCommitted {
+		t.Fatalf("empty summary delta must not mark delivery: %+v", rec)
+	}
+}
+
+// 反向组合：非空摘要增量 + 0 长度正文增量只记摘要交付，text_committed 保持 false。
+func TestIncrementalEmptyTextDeltaDoesNotMarkTextCommitted(t *testing.T) {
+	s := newBPStream("resp_empty_text_delta")
+	s.reasoning("摘要内容。", 1)
+	s.message("", 0)
+	var blocks []string
+	for _, b := range s.terminal() {
+		blocks = append(blocks, b)
+		if strings.HasPrefix(b, "event: response.content_part.added\n") && strings.Contains(b, `"output_text"`) {
+			blocks = append(blocks, "event: response.output_text.delta\ndata: "+string(jsonBytes(map[string]any{"type": "response.output_text.delta", "output_index": 1, "content_index": 0, "item_id": "msg_1", "delta": ""}))+"\n\n")
+		}
+	}
+	h := newIncHost(chunks(blocks, 4))
+	startIncremental(t, h, 5, map[string]any{"model": DefaultModelID, "input": "hi", "stream": true})
+	h.waitClosed(t)
+	events := clientStreamEvents(t, []byte(h.snapshot()))
+	if countType(events, "response.completed") != 1 || countType(events, "response.failed") != 0 {
+		t.Fatalf("stream invalid: %v", eventTypes(events))
+	}
+	if streamedText(events) != "" || streamedSummary(events) != "摘要内容。" {
+		t.Fatalf("delivery content wrong: text=%q summary=%q", streamedText(events), streamedSummary(events))
+	}
+	rec := h.waitSummary(t)
+	if rec.TextCommitted || !rec.SummaryCommitted {
+		t.Fatalf("empty text delta must not mark delivery: %+v", rec)
 	}
 }

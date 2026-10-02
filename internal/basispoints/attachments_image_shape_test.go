@@ -74,6 +74,53 @@ func TestImageFileReferencesRejectConflictingURLs(t *testing.T) {
 	}
 }
 
+// 全部待处理图片先本地验证：前图有效、后图字节格式坏，同样零上传/零生成（不是先上传前图再报错）。
+func TestInvalidLaterImageUploadsNothing(t *testing.T) {
+	dataURL, _ := testImageDataURL(t)
+	badDataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("private-not-an-image"))
+	valid := map[string]any{"type": "input_image", "image_url": dataURL}
+	broken := map[string]any{"type": "input_image", "image_url": badDataURL}
+	// 位置诊断按上游看到的 input（含前置 developer 目录消息）计数。
+	for name, tc := range map[string]struct {
+		input    []any
+		position string
+	}{
+		"same_message": {
+			input:    []any{map[string]any{"role": "user", "content": []any{valid, broken}}},
+			position: "input[1].content[1]",
+		},
+		"later_message": {
+			input: []any{
+				map[string]any{"role": "user", "content": []any{valid}},
+				map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "ok"}}},
+				map[string]any{"role": "user", "content": []any{broken}},
+			},
+			position: "input[3].content[0]",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := NewService()
+			calls := 0
+			service.SetHost(opTolerant(func(string, any, any) error {
+				calls++
+				return errors.New("no upload or Responses call is allowed")
+			}))
+			request := imageRequest()
+			request.Payload = jsonBytes(map[string]any{"input": tc.input})
+			_, _, err := service.prepareRequest(request)
+			if !isKind(err, "invalid_image") || calls != 0 {
+				t.Fatalf("invalid image must be rejected before any host call: calls=%d err=%v", calls, err)
+			}
+			if !strings.Contains(err.Error(), tc.position) {
+				t.Fatalf("missing position %q in %v", tc.position, err)
+			}
+			if strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), base64.StdEncoding.EncodeToString([]byte("private-not-an-image"))) {
+				t.Fatal("invalid image diagnostic exposed input data")
+			}
+		})
+	}
+}
+
 // 冲突预检：前面图片合法、冲突出现在后面或另一条用户消息里，都在任何附件上传前拒绝（上游逐张
 // 处理会先上传前面的图片）。
 func TestImageConflictIsRejectedBeforeAnyUpload(t *testing.T) {
